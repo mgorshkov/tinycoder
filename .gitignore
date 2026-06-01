@@ -1,0 +1,43 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TypeScript
+out/
+*.tsbuildinfo
+
+# C++ build
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.node
+*.so
+*.dylib
+*.dll
+*.lib
+*.exp
+
+# VS Code
+.vscode/settings.json
+*.vsix
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (large files, don't commit)
+*.gguf
+models/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
