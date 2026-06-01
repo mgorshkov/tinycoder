@@ -1,0 +1,14 @@
+.vscode/**
+.vscode-test/**
+.gitignore
+node_modules/**
+src/**
+tsconfig.json
+**/*.ts
+**/*.cpp
+**/*.hpp
+**/CMakeLists.txt
+build/**
+!build/Release/*.node
+!.vscode/launch.json
+!.vscode/tasks.json

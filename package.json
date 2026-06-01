@@ -1,0 +1,209 @@
+{
+  "name": "tinycoder",
+  "displayName": "TinyCoder AI",
+  "description": "Local AI coding assistant powered by Qwen2.5-Coder, Gemma 4, and Qwen3.6 GGUF models. Native C++ inference with AVX2/AVX-512/AMX SIMD acceleration and CUDA GPU support. Runs entirely offline on limited resources.",
+  "version": "0.1.0",
+  "publisher": "tinycoder",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mgorshkov/TinyCoder"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Machine Learning",
+    "Debuggers",
+    "Education"
+  ],
+  "keywords": [
+    "ai",
+    "coding",
+    "code assistant",
+    "code generation",
+    "qwen",
+    "qwen2.5-coder",
+    "gemma4",
+    "llm",
+    "local ai",
+    "offline",
+    "gguf",
+    "quantization",
+    "iq3_xxs",
+    "simd",
+    "avx2",
+    "avx512",
+    "amx",
+    "cpu",
+    "gpu",
+    "cuda",
+    "native"
+  ],
+  "icon": "media/icon.png",
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onView:tinycoder.chat",
+    "onCommand:tinycoder.openPanel",
+    "onCommand:tinycoder.explainCode",
+    "onCommand:tinycoder.completeCode",
+    "onCommand:tinycoder.generateCode",
+    "onCommand:tinycoder.loadModel",
+    "onCommand:tinycoder.showStatus"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tinycoder-sidebar",
+          "title": "TinyCoder AI",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "tinycoder-sidebar": [
+        {
+          "type": "webview",
+          "id": "tinycoder.chat",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "tinycoder.openPanel",
+        "title": "TinyCoder: Open AI Chat Panel"
+      },
+      {
+        "command": "tinycoder.explainCode",
+        "title": "TinyCoder: Explain Selected Code"
+      },
+      {
+        "command": "tinycoder.completeCode",
+        "title": "TinyCoder: Complete Code"
+      },
+      {
+        "command": "tinycoder.generateCode",
+        "title": "TinyCoder: Generate Code from Comment"
+      },
+      {
+        "command": "tinycoder.loadModel",
+        "title": "TinyCoder: Load Model..."
+      },
+      {
+        "command": "tinycoder.showStatus",
+        "title": "TinyCoder: Show Status"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "tinycoder.openPanel",
+        "key": "ctrl+alt+t",
+        "mac": "cmd+alt+t"
+      },
+      {
+        "command": "tinycoder.explainCode",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e"
+      },
+      {
+        "command": "tinycoder.completeCode",
+        "key": "ctrl+alt+c",
+        "mac": "cmd+alt+c"
+      }
+    ],
+    "configuration": {
+      "title": "TinyCoder",
+      "properties": {
+        "tinycoder.modelPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the GGUF model file"
+        },
+        "tinycoder.nThreads": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 64,
+          "description": "Number of CPU threads for inference"
+        },
+        "tinycoder.maxSeqLen": {
+          "type": "number",
+          "default": 8192,
+          "minimum": 512,
+          "maximum": 32768,
+          "description": "Maximum sequence length (context window)"
+        },
+        "tinycoder.maxTokens": {
+          "type": "number",
+          "default": 2048,
+          "minimum": 64,
+          "maximum": 32768,
+          "description": "Maximum tokens to generate per response"
+        },
+        "tinycoder.temperature": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0.0,
+          "maximum": 2.0,
+          "description": "Sampling temperature (higher = more creative)"
+        },
+        "tinycoder.topP": {
+          "type": "number",
+          "default": 0.9,
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "description": "Top-P nucleus sampling threshold"
+        },
+        "tinycoder.topK": {
+          "type": "number",
+          "default": 40,
+          "minimum": 0,
+          "maximum": 200,
+          "description": "Top-K sampling (0 = disabled)"
+        },
+        "tinycoder.repeatPenalty": {
+          "type": "number",
+          "default": 1.1,
+          "minimum": 1.0,
+          "maximum": 2.0,
+          "description": "Repetition penalty"
+        },
+        "tinycoder.repeatLastN": {
+          "type": "number",
+          "default": 64,
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Number of recent tokens to consider for repetition penalty"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile && npm run build:native",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "build:native": "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release",
+    "build:native:avx2": "cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_AVX512=OFF -DENABLE_AMX=OFF && cmake --build build --config Release",
+    "build:native:cuda": "cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON && cmake --build build --config Release",
+    "lint": "eslint src --ext ts",
+    "pretest": "npm run compile",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0",
+    "eslint": "^8.56.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.0.0"
+  }
+}
