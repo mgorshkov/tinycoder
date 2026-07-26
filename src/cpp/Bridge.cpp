@@ -32,11 +32,8 @@ SOFTWARE.
 #include <unistd.h>
 #include <vector>
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
 #include "Model.hpp"
+#include "ThreadPool.hpp"
 
 /// @brief N-API native addon bridge for TinyCoder.
 ///
@@ -394,12 +391,8 @@ namespace {
         long nCPUs = sysconf(_SC_NPROCESSORS_ONLN);
         cpuInfo.Set("cores", Napi::Number::New(env, static_cast<int32_t>(nCPUs > 0 ? nCPUs : 1)));
 
-        // OpenMP threads
-#ifdef _OPENMP
-        cpuInfo.Set("ompThreads", Napi::Number::New(env, omp_get_max_threads()));
-#else
-        cpuInfo.Set("ompThreads", Napi::Number::New(env, 1));
-#endif
+        // Thread pool threads
+        cpuInfo.Set("ompThreads", Napi::Number::New(env, static_cast<int32_t>(tinycoder::ThreadPool::instance().numThreads())));
 
         hwInfo.Set("cpu", cpuInfo);
 
@@ -439,16 +432,17 @@ namespace {
 
 /// @brief Initialize the native addon module.
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
-    // Auto-detect CPU count and set OpenMP threads to match.
+    // Auto-detect CPU count and initialize the thread pool.
     // Uses sysconf (_SC_NPROCESSORS_ONLN) on Linux to get the number of
     // online (available) processors. This ensures all parallel loops use
     // the full CPU count without requiring an external env variable.
-#ifdef _OPENMP
-    long nCPUs = sysconf(_SC_NPROCESSORS_ONLN);
-    if (nCPUs > 0) {
-        omp_set_num_threads(static_cast<int>(nCPUs));
+    {
+        long nCPUs = sysconf(_SC_NPROCESSORS_ONLN);
+        if (nCPUs < 1) {
+            nCPUs = 1;
+        }
+        tinycoder::ThreadPool::instance().initialize(static_cast<size_t>(nCPUs));
     }
-#endif
 
     exports.Set("loadModel", Napi::Function::New(env, LoadModel));
     exports.Set("unloadModel", Napi::Function::New(env, UnloadModel));

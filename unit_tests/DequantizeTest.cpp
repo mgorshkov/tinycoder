@@ -503,3 +503,82 @@ TEST(DequantizeTest, TokenizerPretokenizePattern) {
         FAIL() << "GPT-2 regex pattern failed to compile: " << e.what();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test: Q2_K original vs pre-packed kernel comparison
+// ---------------------------------------------------------------------------
+// Creates a synthetic Q2_K block, pre-packs it, and compares the dot product
+// results from the original and pre-packed kernels for the same input vector.
+// This validates that the pre-packed kernel produces identical results.
+TEST(DequantizeTest, Q2_K_PrePackedVsOriginal) {
+    // Create a synthetic Q2_K block (84 bytes)
+    uint8_t blockData[84] = {};
+
+    // Set d = 2.0 (fp16: 0x4000)
+    blockData[80] = 0x00;
+    blockData[81] = 0x40;
+
+    // Set dmin = 0.5 (fp16: 0x3800)
+    blockData[82] = 0x00;
+    blockData[83] = 0x38;
+
+    // Set scales[16]: each byte has 4-bit scale (low) and 4-bit min (high)
+    // Make them vary so we test all combinations
+    for (int i = 0; i < 16; ++i) {
+        blockData[i] = static_cast<uint8_t>((i << 4) | (15 - i));
+    }
+
+    // Set qs[64]: pack 2-bit values (0, 1, 2, 3) into each byte
+    // Byte k contains values for elements [4k, 4k+1, 4k+2, 4k+3]
+    // bit0-1 = element 4k, bit2-3 = element 4k+1, bit4-5 = element 4k+2, bit6-7 = element 4k+3
+    for (int i = 0; i < 64; ++i) {
+        uint8_t byteVal = 0;
+        for (int b = 0; b < 4; ++b) {
+            uint8_t val = static_cast<uint8_t>((i * 4 + b) % 4);
+            byteVal |= (val << (b * 2));
+        }
+        blockData[16 + i] = byteVal;
+    }
+
+    // Pre-pack the block
+    auto prepacked = GGMLDequantize::prepackQ2_K(blockData, 256);
+    ASSERT_EQ(prepacked.size(), 276u);
+
+    // Create a random x vector of 256 floats
+    float x[256];
+    std::srand(42);
+    for (int i = 0; i < 256; ++i) {
+        x[i] = static_cast<float>(std::rand()) / RAND_MAX * 2.0f - 1.0f;
+    }
+
+    // Compute dot product using original kernel
+    float originalResult = dotProductQ2_K_SIMD(blockData, x);
+
+    // Compute dot product using pre-packed kernel
+    float prepackedResult = dotProductQ2_K_PrePacked_SIMD(prepacked.data(), x);
+
+    // Also compute using the scalar reference (dequantize then dot)
+    float deqRef[256];
+    GGMLDequantize::dequantizeQ2_KBlock(blockData, deqRef);
+    double refDot = 0.0;
+    for (int i = 0; i < 256; ++i) {
+        refDot += static_cast<double>(x[i]) * deqRef[i];
+    }
+    float referenceResult = static_cast<float>(refDot);
+
+    // Print results for debugging
+    std::cout << "  Original kernel:  " << originalResult << std::endl;
+    std::cout << "  Pre-packed kernel: " << prepackedResult << std::endl;
+    std::cout << "  Reference (deq):   " << referenceResult << std::endl;
+
+    // Both kernels should match the reference
+    EXPECT_NEAR(originalResult, referenceResult, 1e-4f)
+            << "Original kernel differs from reference dequantize-then-dot";
+
+    EXPECT_NEAR(prepackedResult, referenceResult, 1e-4f)
+            << "Pre-packed kernel differs from reference dequantize-then-dot";
+
+    // The two kernels should match each other
+    EXPECT_NEAR(originalResult, prepackedResult, 1e-4f)
+            << "Original and pre-packed kernels produce different results";
+}

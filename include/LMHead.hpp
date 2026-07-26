@@ -31,6 +31,7 @@ SOFTWARE.
 #include "GGMLDequantize.hpp"
 #include "GGUFLoader.hpp"
 #include "SIMDMatMulVec.hpp"
+#include "ThreadPool.hpp"
 
 namespace tinycoder {
 
@@ -59,14 +60,13 @@ namespace tinycoder {
         /// @param logits      Output logits vector (size vocabSize, pre-allocated)
         static void computeCPU(const float *hidden, const float *embedData,
                                uint32_t vocabSize, uint32_t hiddenSize, float *logits) {
-// Parallel over vocabulary, SIMD dot product inside
-#pragma omp parallel for schedule(static)
-            for (int32_t i = 0; i < static_cast<int32_t>(vocabSize); ++i) {
+            // Parallel over vocabulary, SIMD dot product inside
+            ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
                 const float *embRow = embedData + static_cast<uint64_t>(i) * hiddenSize;
                 // SIMD-accelerated dot product: dot = sum(hidden[0..hiddenSize) * embRow[0..hiddenSize))
                 float dot = dotProductFMA(hidden, embRow, hiddenSize);
                 logits[i] = dot;
-            }
+            });
         }
 
         /// @brief Compute LM head logits on CPU with on-the-fly dequantization.
@@ -103,24 +103,45 @@ namespace tinycoder {
             }
 
             uint32_t numBlocks = (hiddenSize + blockSize - 1) / blockSize;
+            uint64_t rowStrideBytes = static_cast<uint64_t>(numBlocks) * typeSize;
 
-// Parallel over vocabulary with SIMD dot product inside
-#pragma omp parallel for schedule(static)
-            for (int32_t i = 0; i < static_cast<int32_t>(vocabSize); ++i) {
-                float dot = 0.0f;
-                for (uint32_t b = 0; b < numBlocks; ++b) {
-                    uint64_t blockOffset = static_cast<uint64_t>(i) * numBlocks + b;
-                    const uint8_t *blockData = embedData + blockOffset * typeSize;
-                    float blockOut[256];// max block size is 256
-                    GGMLDequantize::dequantizeBlock(embedType, blockData, blockOut,
-                                                    blockSize);
-                    uint32_t start = b * blockSize;
-                    uint32_t n = std::min(blockSize, hiddenSize - start);
-                    // SIMD-accelerated dot product: dot += sum(hidden[start..start+n) *
-                    // blockOut[0..n))
-                    dot += dotProductFMA(hidden + start, blockOut, n);
+            // Initialize logits to zero (will accumulate block-by-block)
+            std::memset(logits, 0, static_cast<size_t>(vocabSize) * sizeof(float));
+
+            // Pre-resolve the dot product function to hoist the type switch
+            // outside the inner loop (~912K calls per token otherwise).
+            auto dotFunc = GGMLDequantize::getDotProductFunc(embedType);
+
+            // Cache-blocked iteration: process one block column across ALL vocab
+            // entries, then move to the next block. This keeps the hidden segment
+            // (blockSize floats, ~1KB for K-quant) in L1 cache.
+            //
+            // In the original row-major iteration, the full hidden vector (6KB for
+            // hiddenSize=1536) is read from RAM vocabSize=151936 times per token,
+            // totaling ~930MB of hidden vector reads.
+            //
+            // In this cache-blocked version, the hidden vector is read only
+            // numBlocks=6 times per token (~36KB total), with the hot segment
+            // staying in L1 cache throughout the inner vocab loop.
+            for (uint32_t b = 0; b < numBlocks; ++b) {
+                uint32_t start = b * blockSize;
+                uint32_t n = std::min(blockSize, hiddenSize - start);
+                const float *xBlock = hidden + start;
+
+                if (dotFunc && n == blockSize) {
+                    // Fast path: pre-resolved fused dot product for full blocks
+                    ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                        const uint8_t *blockData = embedData + static_cast<uint64_t>(i) * rowStrideBytes + static_cast<uint64_t>(b) * typeSize;
+                        logits[i] += dotFunc(blockData, xBlock);
+                    });
+                } else {
+                    // Fallback: general fused dot product (handles partial blocks
+                    // or types without a dedicated fast path)
+                    ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                        const uint8_t *blockData = embedData + static_cast<uint64_t>(i) * rowStrideBytes + static_cast<uint64_t>(b) * typeSize;
+                        logits[i] += GGMLDequantize::dotProductFused(embedType, blockData, xBlock, n);
+                    });
                 }
-                logits[i] = dot;
             }
         }
 

@@ -263,6 +263,14 @@ TEST_F(ReferenceCompareTest, DumpLayer1FFNBlockData) {
     const auto &layers = SharedTestEnv::model->debugGetLayers();
     ASSERT_GE(layers.size(), 2) << "Model must have at least 2 layers";
 
+    // Skip for MoE architectures that don't use standard FFN weights
+    const auto &config = SharedTestEnv::config;
+    if (config.architecture == "gemma4" || config.architecture == "qwen35moe") {
+        std::cout << "\n=== Skipping FFN block dump for MoE architecture: "
+                  << config.architecture << " ===" << std::endl;
+        return;
+    }
+
     const auto &gate = layers[1].ffnGate;
     const auto &up = layers[1].ffnUp;
     const auto &down = layers[1].ffnDown;
@@ -347,6 +355,14 @@ TEST_F(ReferenceCompareTest, MatMulVecUnitVector) {
     const auto &layers = SharedTestEnv::model->debugGetLayers();
     ASSERT_GE(layers.size(), 2);
 
+    // Skip for MoE architectures that don't use standard FFN weights
+    const auto &config = SharedTestEnv::config;
+    if (config.architecture == "gemma4" || config.architecture == "qwen35moe") {
+        std::cout << "\n=== Skipping matMulVec unit vector test for MoE architecture: "
+                  << config.architecture << " ===" << std::endl;
+        return;
+    }
+
     const auto &gate = layers[1].ffnGate;
     const auto &up = layers[1].ffnUp;
     const auto &down = layers[1].ffnDown;
@@ -392,6 +408,14 @@ TEST_F(ReferenceCompareTest, MatMulVecUnitVector) {
 TEST_F(ReferenceCompareTest, MatMulVecAlternatingInput) {
     const auto &layers = SharedTestEnv::model->debugGetLayers();
     ASSERT_GE(layers.size(), 2);
+
+    // Skip for MoE architectures that don't use standard FFN weights
+    const auto &config = SharedTestEnv::config;
+    if (config.architecture == "gemma4" || config.architecture == "qwen35moe") {
+        std::cout << "\n=== Skipping matMulVec alternating input test for MoE architecture: "
+                  << config.architecture << " ===" << std::endl;
+        return;
+    }
 
     const auto &gate = layers[1].ffnGate;
     const auto &up = layers[1].ffnUp;

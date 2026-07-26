@@ -65,7 +65,6 @@ namespace tinycoder {
                 return result;
             } catch (const std::exception &e) {
                 // CUDA failed (no GPU, no driver, OOM, etc.) — fall back to CPU
-                // Log the error for debugging
                 std::fprintf(stderr, "CUDA dot1d2d failed, falling back to CPU: %s\n",
                              e.what());
             }
@@ -87,6 +86,13 @@ namespace tinycoder {
     }
 
     np::Array<float> QuantizedMatrix::matMulVec(const float *x) const {
+        // Allocate result and delegate to the out-parameter version
+        np::Array<float> result(np::Shape{rows});
+        matMulVec(x, result.data());
+        return result;
+    }
+
+    void QuantizedMatrix::matMulVec(const float *x, float *out) const {
         // Compute y = x * W where W is this quantized matrix.
         // W has dimensions (rows x cols) = (out_features x in_features), stored
         // row-major in GGUF format. x is a row vector of size cols (in_features).
@@ -110,64 +116,99 @@ namespace tinycoder {
         //
         // For F32 matrices, we still use the CUDA/CPU path.
 
-        // DIAGNOSTIC: Print parameters for Q/K/V calls for all tokens
-        static int callCount = 0;
-        ++callCount;
-        // Print for ALL calls to see if any specific call produces wrong results
-        // Q/K/V for 28 tokens = 84 calls. Print all.
-        if (callCount <= 90) {
-            std::cout << "[DIAG_MATMUL] call=" << callCount
-                      << " type=" << type << " rows=" << rows << " cols=" << cols
-                      << " data.size=" << data.size()
-                      << " data.ptr=" << (void *) data.data()
-                      << " x[0]=" << x[0] << " x[1]=" << x[1] << std::endl;
-        }
-
         // For F32 type, use the CUDA/CPU path (no dequantization needed)
         if (type == GGML_TYPE_F32) {
             const float *W_f32 = reinterpret_cast<const float *>(data.data());
-            return matMulVecCUDA(x, W_f32, rows, cols);
+            // For F32, compute directly into out (avoiding the CUDA path's allocation)
+            for (uint32_t j = 0; j < rows; ++j) {
+                double dot = 0.0;
+                for (uint32_t i = 0; i < cols; ++i) {
+                    dot += static_cast<double>(x[i]) * W_f32[static_cast<size_t>(j) * cols + i];
+                }
+                out[j] = static_cast<float>(dot);
+            }
+            return;
         }
 
         // For quantized types, use block-level fused dequantize-dot
         // matMulVecFused computes y_j = sum_i x[i] * W[j][i]
         // where x has size cols, result has size rows
-        np::Array<float> result(np::Shape{rows});
-        float *resultData = result.data();
 
-        GGMLDequantize::matMulVecFused(type, data.data(), x, rows, cols, resultData);
-
-        // DIAGNOSTIC: Also compute using a separate buffer and compare
-        if (callCount <= 90) {
-            std::vector<float> diagResult(rows);
-            GGMLDequantize::matMulVecFused(type, data.data(), x, rows, cols, diagResult.data());
-            float rms1 = 0.0f, rms2 = 0.0f;
-            for (uint32_t i = 0; i < rows; ++i) {
-                rms1 += resultData[i] * resultData[i];
-                rms2 += diagResult[i] * diagResult[i];
-            }
-            rms1 = std::sqrt(rms1 / rows);
-            rms2 = std::sqrt(rms2 / rows);
-            bool match = true;
-            for (uint32_t i = 0; i < std::min(rows, 8u); ++i) {
-                if (std::abs(resultData[i] - diagResult[i]) > 1e-5f) match = false;
-            }
-            std::cout << "[DIAG_MATMUL] call=" << callCount
-                      << " result rms=" << rms1 << " diag rms=" << rms2
-                      << " match=" << (match ? "YES" : "NO")
-                      << " result[0]=" << resultData[0]
-                      << " diag[0]=" << diagResult[0] << std::endl;
-            if (!match) {
-                std::cout << "[DIAG_MATMUL] call=" << callCount << " MISMATCH! result first 8: ";
-                for (uint32_t i = 0; i < 8; ++i) std::cout << resultData[i] << " ";
-                std::cout << std::endl;
-                std::cout << "[DIAG_MATMUL] call=" << callCount << " MISMATCH! diag first 8: ";
-                for (uint32_t i = 0; i < 8; ++i) std::cout << diagResult[i] << " ";
-                std::cout << std::endl;
-            }
+        // OPTIMIZATION: Use pre-packed kernel for Q2_K matrices that have been
+        // pre-packed at load time. The pre-packed format eliminates the 2-bit
+        // extraction overhead in the SIMD kernel.
+        if (type == GGML_TYPE_Q2_K && !prepackedData.empty()) {
+            GGMLDequantize::matMulVecFusedQ2_K_PrePacked(prepackedData.data(), x, rows, cols, out);
+            return;
         }
 
+        // Use cache-blocked version for large matrices (rows > 256) to keep
+        // the x vector in L1 cache. For small matrices, the non-blocked version
+        // is fine and avoids the memset overhead.
+        if (rows > 256) {
+            GGMLDequantize::matMulVecFusedCacheBlocked(type, data.data(), x, rows, cols, out);
+        } else {
+            GGMLDequantize::matMulVecFused(type, data.data(), x, rows, cols, out);
+        }
+    }
+
+    np::Array<float> QuantizedMatrix::matMulVecRows(const float *x, uint32_t rowStart, uint32_t numRows) const {
+        // Allocate result and delegate to the out-parameter version
+        np::Array<float> result(np::Shape{numRows});
+        matMulVecRows(x, rowStart, numRows, result.data());
         return result;
+    }
+
+    void QuantizedMatrix::matMulVecRows(const float *x, uint32_t rowStart, uint32_t numRows, float *out) const {
+        // Compute y = x * W for a contiguous range of rows [rowStart, rowStart + numRows).
+        // W has dimensions (rows x cols) = (out_features x in_features), stored row-major.
+        // This is used for expert sub-matrices in MoE architectures where multiple
+        // experts are stored in a single QuantizedMatrix.
+        //
+        // The data layout is: expert 0 rows, expert 1 rows, ..., expert N-1 rows.
+        // Each expert has expertFF rows (for gate/up) or hiddenSize rows (for down).
+        //
+        // We compute y_j = sum_i x[i] * W[rowStart + j][i] for j in [0, numRows)
+
+        if (rowStart + numRows > rows) {
+            std::cerr << "[TinyCoder] matMulVecRows: rowStart=" << rowStart
+                      << " numRows=" << numRows << " exceeds rows=" << rows << std::endl;
+            std::memset(out, 0, static_cast<size_t>(numRows) * sizeof(float));
+            return;
+        }
+
+        if (type == GGML_TYPE_F32) {
+            const float *W_f32 = reinterpret_cast<const float *>(data.data());
+            const float *W_start = W_f32 + static_cast<size_t>(rowStart) * cols;
+            for (uint32_t j = 0; j < numRows; ++j) {
+                double dot = 0.0;
+                for (uint32_t i = 0; i < cols; ++i) {
+                    dot += static_cast<double>(x[i]) * W_start[static_cast<size_t>(j) * cols + i];
+                }
+                out[j] = static_cast<float>(dot);
+            }
+        } else {
+            // For quantized types, compute row by row using the fused quantized dot product.
+            // This eliminates the float blockBuf[256] temporary and the extra memory pass.
+            uint32_t blockSize = ggmlBlockSize(type);
+            uint32_t typeSize = ggmlTypeSize(type);
+            uint64_t blocksPerRow = (static_cast<uint64_t>(cols) + blockSize - 1) / blockSize;
+            uint64_t bytesPerRow = blocksPerRow * typeSize;
+            const uint8_t *rowData = data.data() + static_cast<size_t>(rowStart) * bytesPerRow;
+
+            for (uint32_t j = 0; j < numRows; ++j) {
+                const uint8_t *rowPtr = rowData + j * bytesPerRow;
+                double dot = 0.0;
+                uint32_t remaining = cols;
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    uint32_t blockN = std::min(blockSize, remaining);
+                    // Fused quantized dot product: dequantize and dot in one pass
+                    dot += static_cast<double>(GGMLDequantize::dotProductFused(type, rowPtr + b * typeSize, x + b * blockSize, blockN));
+                    remaining -= blockN;
+                }
+                out[j] = static_cast<float>(dot);
+            }
+        }
     }
 
 }// namespace tinycoder

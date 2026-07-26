@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.18.0)
 
 set(PROJECT_NAME tinycoder_unit_tests)
 
-project(${PROJECT_NAME} VERSION 0.1.0 DESCRIPTION "TinyCoder Unit Tests")
+project(${PROJECT_NAME} VERSION 0.2.0 DESCRIPTION "TinyCoder Unit Tests")
 
 include(FetchContent)
 
@@ -27,6 +27,8 @@ add_executable(tinycoder_test
     ModelTest.cpp
     DequantizeTest.cpp
     ReferenceCompareTest.cpp
+    ThreadPoolReentrancyTest.cpp
+    SharedTestEnv.cpp
 )
 
 target_link_libraries(tinycoder_test
@@ -45,3 +47,6 @@ set_target_properties(tinycoder_test PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
 )
+
+# Register the test with CTest
+add_test(NAME tinycoder_test COMMAND tinycoder_test)
