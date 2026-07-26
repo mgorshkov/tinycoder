@@ -275,9 +275,10 @@ Place the `.gguf` file in the models directory and load it from the TinyCoder pa
 
 **Memory breakdown (1.5B model):**
 - Quantized weights: ~637 MB (stored in native format, no dequantization)
+- FP16 dequantized copies (attnO + ffnDown): ~30.7 MB (half of previous F32 ~61.5 MB)
 - KV cache (2048 context): ~112 MB (F32, 28 layers × 2 KV heads × 128 dim)
 - Norms + activations: ~1 MB
-- **Total steady state: ~750 MB**
+- **Total steady state: ~781 MB**
 
 ## Technical Details
 
@@ -315,7 +316,9 @@ IQ2_S Block (256 weights, 82 bytes):
 
 ### Fused Dequantize-Dot Product
 
-Instead of dequantizing entire matrices to F32 (which would require ~5.2 GB for the 1.5B model), [`QuantizedMatrix::matMulVec()`](src/cpp/QuantizedMatrix.cpp:83) uses a **block-level fused approach**:
+Instead of dequantizing entire matrices to F32 (which would require ~5.2 GB for the 1.5B model), [`QuantizedMatrix::matMulVec()`](src/cpp/QuantizedMatrix.cpp:83) uses a **block-level fused approach** with two strategies:
+
+#### Strategy 1: Dequantize-then-Dot (legacy, for non-K-quant types)
 
 1. For each output row, iterate over quantized blocks
 2. Dequantize one block at a time into a small stack buffer (max 256 floats)
@@ -324,14 +327,107 @@ Instead of dequantizing entire matrices to F32 (which would require ~5.2 GB for 
 
 This avoids allocating large float buffers and reduces memory bandwidth.
 
+#### Strategy 2: Fused Dot Product (K-quant types: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)
+
+For K-quant types, the dequantization and dot product are **fully fused** — no float temporary buffer is created at all. Each group of 16 weights sharing the same (scale, min) pair is processed as:
+
+```
+sum_xq = Σ x[i] × quant[i]    (quantized values: 0-3 for Q2_K, etc.)
+sum_x  = Σ x[i]
+dot   += dl × sum_xq - ml × sum_x
+```
+
+where `dl = d × scale` and `ml = dmin × min`. This is mathematically equivalent to `dot += x[i] × (dl × quant[i] - ml)` but avoids writing 256 floats to the stack and reading them back.
+
+The dispatch chain is:
+
+```
+dotProductFused()                    ← GGMLDequantize.hpp:1392
+  └─ dotProductQ2_K()               ← GGMLDequantize.hpp:1121 (delegates to SIMD)
+       └─ dotProductQ2_K_SIMD()     ← SIMDMatMulVec.cpp:926 (runtime dispatch)
+            ├─ dotProductQ2_K_AVX2() ← SIMDMatMulVec.cpp:406 (AVX2 path)
+            └─ dotProductQ2_K_Scalar() ← SIMDMatMulVec.cpp:109 (scalar fallback)
+```
+
+#### Q2_K Block Layout and AVX2 Strategy
+
+The Q2_K block packs 256 2-bit weights into 84 bytes:
+
+```
+Q2_K Block (256 weights, 84 bytes):
+┌──────────────────────────────────────────────────────────────┐
+│  scales[16]   qs[64]          d(F16)   dmin(F16)            │
+│  16 bytes     64 bytes        2 bytes  2 bytes               │
+└──────────────────────────────────────────────────────────────┘
+  scales: 4-bit scale (low nibble) + 4-bit min (high nibble) per group of 16
+  qs:     2-bit quantized values (0-3), 4 values per byte
+  d:      super-block scale (fp16)
+  dmin:   super-block minimum (fp16)
+  Dequant: w = d × scale × quant - dmin × min
+```
+
+The AVX2 implementation processes 16 weights per group using two `__m256` vectors (8 each):
+
+1. **Load** 16 bytes of q data via `_mm_loadu_si128`
+2. **Zero-extend** bytes to 32-bit ints via `_mm256_cvtepu8_epi32`
+3. **Variable shift** right by `shift` (0,2,4,6) via `_mm256_srlv_epi32` to align the 2-bit field
+4. **Mask** with 3 via `_mm256_and_si256` to extract the 2-bit quant value
+5. **Convert** to float via `_mm256_cvtepi32_ps`
+6. **Fused multiply-subtract**: `val = dl × quant - ml` via `_mm256_fmsub_ps`
+7. **Fused multiply-add**: `acc += x × val` via `_mm256_fmadd_ps`
+
+This eliminates the float `blockOut[256]` temporary and the extra memory pass, reducing both compute and memory bandwidth.
+
+#### Dual-Format Strategy for attnO and ffnDown
+
+The output projection matrices [`attnO`](include/Model.hpp:141) and [`ffnDown`](include/Model.hpp:149) are stored in **two formats** simultaneously:
+
+| Format | Storage | Memory | Used For |
+|--------|---------|--------|----------|
+| **Native Q2_K/Q3_K** | `QuantizedMatrix` | ~1.0 MB / ~5.8 MB | Fused dot product via `matMulVec()` |
+| **Pre-dequantized FP16** | `std::vector<uint16_t>` | ~4.5 MB / ~26.2 MB | Exact float dot product via `deqMatMulVecF16()` |
+
+The FP16 copies are dequantized once during model loading ([`Model::loadWeights()`](src/cpp/Model.cpp:235)) using [`GGMLDequantize::dequantizeToF16()`](include/GGMLDequantize.hpp:1650), which dequantizes one block at a time into a small stack buffer and converts each value to FP16 inline — avoiding the large intermediate F32 allocation entirely.
+
+During the forward pass, [`deqMatMulVecF16()`](src/cpp/Model.cpp:1209) converts FP16 weights back to FP32 on-the-fly using the **F16C** instruction (`_mm256_cvtph_ps`), which converts 8 FP16 values to 8 FP32 values in a single instruction. This is available on all CPUs that support AVX2 (F16C is implied by `-mavx2` on most compilers, but GCC 13+ requires explicit `-mf16c`).
+
+This is a deliberate trade-off: the FP16 copies consume ~30.7 MB extra memory (half of the previous F32 ~61.5 MB) while avoiding repeated dequantization of the same weights across multiple tokens. The memory bandwidth savings from FP16 (vs F32) also improve cache utilization during the forward pass.
+
+All other weight matrices (Q, K, V, gate, up) use only their native quantized format and rely on the fused dot product path.
+
+#### Weight Pre-Packing for Q2_K (ffnGate / ffnUp)
+
+The Q2_K block stores 256 2-bit values packed into 64 bytes (4 values per byte). The AVX2 kernel spends ~10 instructions per group extracting these 2-bit values (shift, mask, expand, pack). With 8 groups per block, that's 80 instructions per block just for bit extraction.
+
+**Pre-packing** expands the 2-bit values to full bytes (0-3) in element order at load time, so the SIMD kernel can load them with a single `_mm_loadu_si128` per group:
+
+```
+Pre-packed Q2_K Block (276 bytes):
+┌──────────────────────────────────────────────────────────────────┐
+│  scales[16]  d(F16)  dmin(F16)  qs_expanded[256]                │
+│  16 bytes    2 bytes  2 bytes    256 bytes (each byte is 0-3)    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Target:** Only [`ffnGate`](include/Model.hpp:144) and [`ffnUp`](include/Model.hpp:145) — these account for 97.7% of Q2_K dot product calls during inference. Memory overhead: ~28.3 MB for both matrices in Qwen2.5-Coder-7B.
+
+**Implementation:**
+- Pre-packing happens at load time in [`Model::loadWeights()`](src/cpp/Model.cpp:434) via [`GGMLDequantize::prepackQ2_K()`](include/GGMLDequantize.hpp:1693)
+- Stored in [`QuantizedMatrix::prepackedData`](include/Model.hpp:57)
+- Runtime dispatch in [`dotProductQ2_K_PrePacked_SIMD()`](src/cpp/SIMDMatMulVec.cpp:1410) selects AVX2 or scalar kernel
+- The pre-packed kernel is mathematically identical to the original (validated by `CompareBatchVsSequentialPrefill` test producing identical results)
+
 ### SIMD Runtime Dispatch
 
-The [`SIMDMatMulVec`](src/cpp/SIMDMatMulVec.cpp) module provides two key operations with runtime dispatch:
+The [`SIMDMatMulVec`](src/cpp/SIMDMatMulVec.cpp) module provides five key operations with runtime dispatch:
 
 - **`dotProductFMA()`** — Dot product of two float vectors
+- **`dotProductFMA_F16()`** — Dot product of float vector with FP16-stored weights (uses `_mm256_cvtph_ps` on AVX2)
 - **`accumulateFMA()`** — Fused multiply-add accumulation
+- **`dotProductQ2_K_SIMD()`** — Fused Q2_K dequantize-dot product for native Q2_K blocks (AVX2/scalar)
+- **`dotProductQ2_K_PrePacked_SIMD()`** — Fused Q2_K dot product for pre-packed blocks (eliminates 2-bit extraction, AVX2/scalar)
 
-Both use `std::atomic` function pointers initialized on first call via `np::internal::max_simd_level()`:
+All use `std::atomic` function pointers initialized on first call via `np::internal::max_simd_level()`:
 
 ```cpp
 // Auto-detected at startup, cached forever
@@ -339,7 +435,7 @@ SimdLevel level = np::internal::max_simd_level();
 // SCALAR < SSE2 < SSE3 < AVX < AVX2 < AVX512 < AMX
 ```
 
-Only [`SIMDMatMulVec.cpp`](src/cpp/SIMDMatMulVec.cpp) is compiled with SIMD ISA flags (`-mavx2 -mfma`, `-mavx512f`, `-mamx-tile`), preventing AVX code generation in other translation units. When AMX is available, the dot product uses tile matrix operations (`_tile_dpbusd`) for 8-bit quantized data with significantly higher throughput.
+Only [`SIMDMatMulVec.cpp`](src/cpp/SIMDMatMulVec.cpp) is compiled with SIMD ISA flags (`-mavx2 -mfma -mf16c`, `-mavx512f`, `-mamx-tile`), preventing AVX code generation in other translation units. When AMX is available, the dot product uses tile matrix operations (`_tile_dpbusd`) for 8-bit quantized data with significantly higher throughput.
 
 ### GGUF Format Support
 

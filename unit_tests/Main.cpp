@@ -36,12 +36,23 @@ SOFTWARE.
  */
 
 #include "SharedTestEnv.hpp"
+#include "ThreadPool.hpp"
 #include <cstdlib>
 #include <gtest/gtest.h>
 #include <string>
+#include <unistd.h>
 
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
+
+    // Initialize the thread pool with the number of available CPUs
+    {
+        long nCPUs = sysconf(_SC_NPROCESSORS_ONLN);
+        if (nCPUs < 1) {
+            nCPUs = 1;
+        }
+        tinycoder::ThreadPool::instance().initialize(static_cast<size_t>(nCPUs));
+    }
 
     // Read model path from environment variable
     const char *envPath = std::getenv("TINYCODER_MODEL_PATH");
@@ -54,6 +65,10 @@ int main(int argc, char **argv) {
         if (std::string(argv[i]) == "--model-path" && i + 1 < argc) {
             SharedTestEnv::modelPath = argv[++i];
         }
+    }
+    // If no model path provided, use a default model for unit tests.
+    if (SharedTestEnv::modelPath.empty()) {
+        SharedTestEnv::modelPath = "/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf";
     }
 
     // Register the shared test environment (loads model once before all tests)

@@ -51,6 +51,11 @@ namespace tinycoder {
         uint32_t cols = 0;        // Number of columns (input dim)
         uint32_t type = 0;        // GGML_TYPE_* enum
 
+        // Pre-packed Q2_K data (expanded 2-bit values to bytes 0-3).
+        // Only populated for ffnGate and ffnUp when type == GGML_TYPE_Q2_K.
+        // Eliminates bit extraction overhead in the SIMD kernel.
+        std::vector<uint8_t> prepackedData;
+
         bool empty() const { return data.empty(); }
 
         /// @brief Compute y = x * W^T where W is this quantized matrix.
@@ -58,6 +63,30 @@ namespace tinycoder {
         /// @param x Input vector of size rows
         /// @return Output vector of size cols as np::Array<float>
         np::Array<float> matMulVec(const float *x) const;
+
+        /// @brief Compute y = x * W^T where W is this quantized matrix.
+        /// Out-parameter version that writes directly to a pre-allocated buffer,
+        /// avoiding the heap allocation and memcpy of the return-value version.
+        /// @param x Input vector of size cols
+        /// @param out Output buffer of size rows (must be pre-allocated by caller)
+        void matMulVec(const float *x, float *out) const;
+
+        /// @brief Compute y = x * W^T for a contiguous range of rows.
+        /// Used for expert sub-matrices in MoE architectures where multiple
+        /// experts are stored in a single QuantizedMatrix.
+        /// @param x Input vector of size cols
+        /// @param rowStart Starting row index
+        /// @param numRows Number of rows to compute
+        /// @return Output vector of size numRows
+        np::Array<float> matMulVecRows(const float *x, uint32_t rowStart, uint32_t numRows) const;
+
+        /// @brief Compute y = x * W^T for a contiguous range of rows.
+        /// Out-parameter version that writes directly to a pre-allocated buffer.
+        /// @param x Input vector of size cols
+        /// @param rowStart Starting row index
+        /// @param numRows Number of rows to compute
+        /// @param out Output buffer of size numRows (must be pre-allocated by caller)
+        void matMulVecRows(const float *x, uint32_t rowStart, uint32_t numRows, float *out) const;
     };
 
     /// @brief Qwen2.5-Coder transformer model.
@@ -107,32 +136,77 @@ namespace tinycoder {
 
         /// @brief Per-layer weights (stored in native quantized format).
         struct LayerWeights {
+            // ---- Common attention weights ----
             QuantizedMatrix attnQ;// hiddenSize x (nHeads * headDim)
             QuantizedMatrix attnK;// hiddenSize x (nKVHeads * headDim)
             QuantizedMatrix attnV;// hiddenSize x (nKVHeads * headDim)
             QuantizedMatrix attnO;// (nHeads * headDim) x hiddenSize (quantized)
 
-            np::Array<float> attnO_deq;// (nHeads * headDim) x hiddenSize (F32)
+            // Dequantized FP16 copy of attnO (halves memory bandwidth vs F32)
+            std::vector<uint16_t> attnO_deq_f16;// (nHeads * headDim) x hiddenSize (FP16)
 
-            // FFN weights (SwiGLU)
+            // ---- Common FFN weights (SwiGLU) ----
             QuantizedMatrix ffnGate;// hiddenSize x intermediateSize
             QuantizedMatrix ffnUp;  // hiddenSize x intermediateSize
             QuantizedMatrix ffnDown;// intermediateSize x hiddenSize
 
-            // Dequantized F32 copy of ffnDown for exact float dot product matching
-            // the reference. ffnDown is Q3_K (type 11) in the Q2_K model, same as
-            // attnO. The block-level fused dequantize-dot in matMulVecFused produces
-            // slightly different results than full dequantize + float dot product.
-            np::Array<float> ffnDown_deq;// intermediateSize x hiddenSize (F32)
+            // Dequantized FP16 copy of ffnDown (halves memory bandwidth vs F32)
+            std::vector<uint16_t> ffnDown_deq_f16;// intermediateSize x hiddenSize (FP16)
 
-            // RMSNorm (F32 — tiny, just hiddenSize elements)
+            // ---- Common RMSNorm (F32) ----
             np::Array<float> rmsNormAttn;// hiddenSize
             np::Array<float> rmsNormFFN; // hiddenSize
 
-            // Q, K, V biases (F32)
+            // ---- Qwen2-specific: Q, K, V biases (F32) ----
             np::Array<float> attnQBias;// nHeads * headDim
             np::Array<float> attnKBias;// nKVHeads * headDim
             np::Array<float> attnVBias;// nKVHeads * headDim
+
+            // ---- Gemma4-specific: Q/K norms, post norms, layer scale ----
+            np::Array<float> attnQNorm;       // headDim (QK RMSNorm before RoPE)
+            np::Array<float> attnKNorm;       // headDim (QK RMSNorm before RoPE)
+            np::Array<float> postAttnNorm;    // hiddenSize (post-attention norm)
+            np::Array<float> postFFWNorm;     // hiddenSize (post-FFN norm)
+            np::Array<float> layerOutputScale;// 1 (per-layer scaling factor)
+
+            // ---- Gemma4 MoE-specific: expert weights ----
+            QuantizedMatrix ffnGateInp;   // hiddenSize x expertCount (router)
+            QuantizedMatrix ffnGateUpExps;// expertCount x (expertFF * 2) x hiddenSize (fused gate+up)
+            QuantizedMatrix ffnDownExps;  // expertCount x hiddenSize x expertFF
+            np::Array<float> preFFWNorm2; // hiddenSize (second pre-FFN norm)
+            np::Array<float> postFFWNorm1;// hiddenSize (first post-FFN norm)
+            np::Array<float> postFFWNorm2;// hiddenSize (second post-FFN norm)
+
+            // ---- Qwen35MoE-specific: attention gate, QKV fused ----
+            QuantizedMatrix attnQKV;      // hiddenSize x (nHeads + 2*nKVHeads) * headDim (fused QKV)
+            QuantizedMatrix attnGate;     // hiddenSize x (nHeads * headDim) (attention gate)
+            np::Array<float> attnQNormMoe;// headDim (Q norm for Qwen35MoE)
+            np::Array<float> attnKNormMoe;// headDim (K norm for Qwen35MoE)
+
+            // ---- Qwen35MoE: SSM (Mamba-style) ----
+            QuantizedMatrix ssmConv1d; // ssmInnerSize x ssmConvKernel
+            QuantizedMatrix ssmOut;    // ssmInnerSize x hiddenSize
+            np::Array<float> ssmA;     // ssmInnerSize x ssmStateSize (log)
+            np::Array<float> ssmDtBias;// ssmInnerSize
+            np::Array<float> ssmAlpha; // ssmInnerSize
+            np::Array<float> ssmBeta;  // ssmInnerSize
+            np::Array<float> ssmNorm;  // ssmInnerSize
+
+            // ---- Qwen35MoE: MoE FFN ----
+            QuantizedMatrix ffnGateInpMoe;  // hiddenSize x expertCount (router)
+            QuantizedMatrix ffnGateExps;    // expertCount x expertFF x hiddenSize
+            QuantizedMatrix ffnUpExps;      // expertCount x expertFF x hiddenSize
+            QuantizedMatrix ffnDownExpsMoe; // expertCount x hiddenSize x expertFF
+            QuantizedMatrix ffnGateShexp;   // hiddenSize x sharedExpertFF (shared expert gate)
+            QuantizedMatrix ffnUpShexp;     // hiddenSize x sharedExpertFF (shared expert up)
+            QuantizedMatrix ffnDownShexp;   // sharedExpertFF x hiddenSize (shared expert down)
+            QuantizedMatrix ffnGateInpShexp;// hiddenSize x 1 (shared expert router)
+
+            // ---- Qwen35MoE: MTP (Multi-Token Prediction) ----
+            QuantizedMatrix nextnEhProj;         // hiddenSize x hiddenSize (embedding head projection)
+            np::Array<float> nextnEnorm;         // hiddenSize (embedding head norm)
+            np::Array<float> nextnHnorm;         // hiddenSize (hidden norm)
+            np::Array<float> nextnSharedHeadNorm;// hiddenSize (shared head norm)
         };
 
         /// @brief Progress callback type for model loading.
@@ -265,6 +339,39 @@ namespace tinycoder {
         /// @brief Build prefill tokens from prompt.
         std::vector<int32_t> tokenize(const std::string &prompt);
 
+        /// @brief Format a chat prompt using the model's chat template.
+        /// @param messages Vector of {role, content} pairs (e.g., {"user", "Hello"})
+        /// @param addGenerationPrompt Whether to append the assistant prefix
+        /// @return Formatted prompt string
+        std::string formatChat(const std::vector<std::pair<std::string, std::string>> &messages,
+                               bool addGenerationPrompt = true) const;
+
+        /// @brief Compute MoE FFN for Gemma4 architecture.
+        /// Routes tokens to top-k experts, computes expert FFN, and combines outputs.
+        /// @param ffnNorm Input to the MoE FFN (seqLen x hiddenSize)
+        /// @param ffnOut Output buffer (seqLen x hiddenSize)
+        /// @param seqLen Number of tokens
+        /// @param hiddenSize Hidden dimension
+        /// @param intermediateSize FFN intermediate dimension (per-expert)
+        /// @param w Layer weights containing MoE tensors
+        void computeGemma4MoE(const float *ffnNorm, float *ffnOut,
+                              uint32_t seqLen, uint32_t hiddenSize,
+                              uint32_t intermediateSize,
+                              const LayerWeights &w) const;
+
+        /// @brief Compute MoE FFN for Qwen35MoE architecture.
+        /// Routes tokens to top-k experts, computes expert FFN + shared expert, and combines outputs.
+        /// @param ffnNorm Input to the MoE FFN (seqLen x hiddenSize)
+        /// @param ffnOut Output buffer (seqLen x hiddenSize)
+        /// @param seqLen Number of tokens
+        /// @param hiddenSize Hidden dimension
+        /// @param intermediateSize FFN intermediate dimension (per-expert)
+        /// @param w Layer weights containing MoE tensors
+        void computeQwen35MoE(const float *ffnNorm, float *ffnOut,
+                              uint32_t seqLen, uint32_t hiddenSize,
+                              uint32_t intermediateSize,
+                              const LayerWeights &w) const;
+
     private:
         // ---- Model weights (stored in native quantized format) ----
 
@@ -296,6 +403,12 @@ namespace tinycoder {
             np::Array<float> k;// numLayers x maxSeqLen x numKVHeads x headDim
             np::Array<float> v;// numLayers x maxSeqLen x numKVHeads x headDim
             size_t pos = 0;    // Current write position
+
+            // SSM state for Qwen35MoE architecture (per-layer)
+            // convBuf: [numLayers][ssmConvKernel - 1] (past conv1d inputs)
+            std::vector<std::vector<float>> ssmConvBuf;
+            // ssmState: [numLayers][ssmInnerSize * ssmStateSize] (SSM hidden state)
+            std::vector<std::vector<float>> ssmState;
         };
         KVCache kvCache_;
 
@@ -303,7 +416,7 @@ namespace tinycoder {
 
         /// @brief Apply RMSNorm (optimized with direct pointer access).
         void rmsNormInPlace(const float *x, float *out, const float *weight,
-                            uint32_t n, float eps = 1e-6f);
+                            uint32_t n, float eps = 1e-6f) const;
 
         /// @brief Apply RoPE (Rotary Position Embedding) with precomputed
         /// frequencies.
@@ -323,6 +436,20 @@ namespace tinycoder {
 
         /// @brief SiLU (Sigmoid Linear Unit) activation in-place.
         void siluInPlace(float *x, uint32_t n);
+
+        /// @brief GeLU (Gaussian Error Linear Unit) activation in-place.
+        /// Used by Gemma4 architecture.
+        void geluInPlace(float *x, uint32_t n) const;
+
+        /// @brief Apply final logit softcapping: tanh(x / cap) * cap.
+        /// Used by Gemma4 architecture.
+        void softcapInPlace(float *x, uint32_t n, float cap);
+
+        /// @brief Apply Q/K norms (per-head RMSNorm before RoPE).
+        /// Used by Gemma4 and Qwen35MoE architectures.
+        void applyQKNorms(float *q, float *k, uint32_t seqLen,
+                          uint32_t qHeads, uint32_t kHeads,
+                          const float *qNorm, const float *kNorm);
 
         /// @brief Load weights from GGUF (stores in native quantized format).
         bool loadWeights(GGUFLoader &loader);

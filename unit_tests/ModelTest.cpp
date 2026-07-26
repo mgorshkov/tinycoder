@@ -35,6 +35,7 @@ SOFTWARE.
  *   TINYCODER_MODEL_PATH=<path_to_model.gguf> ./tinycoder_test
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -269,12 +270,11 @@ bool SampleQuestionTest::quickMode = false;
 TEST_P(SampleQuestionTest, AnswersQuestion) {
     const auto &qa = GetParam();
 
-    std::string prompt = "<|im_start|>system\nYou are TinyCoder, an AI coding "
-                         "assistant. Be concise.<|im_end|>\n"
-                         "<|im_start|>user\n" +
-                         qa.question +
-                         "<|im_end|>\n"
-                         "<|im_start|>assistant\n";
+    // Use formatChat() to build the prompt in an architecture-aware way
+    std::string prompt = SharedTestEnv::model->formatChat(
+            {{"system", "You are TinyCoder, an AI coding assistant. Be concise."},
+             {"user", qa.question}},
+            true);
 
     InferenceParams params;
     params.maxTokens = 64;
@@ -342,12 +342,10 @@ INSTANTIATE_TEST_SUITE_P(FullQuestions, SampleQuestionTest,
 // ===========================================================================
 TEST_F(ModelTest, TracePrefillTokenByToken) {
     std::string question = "What is the capital of France?";
-    std::string prompt = "<|im_start|>system\nYou are TinyCoder, an AI coding "
-                         "assistant. Be concise.<|im_end|>\n"
-                         "<|im_start|>user\n" +
-                         question +
-                         "<|im_end|>\n"
-                         "<|im_start|>assistant\n";
+    std::string prompt = SharedTestEnv::model->formatChat(
+            {{"system", "You are TinyCoder, an AI coding assistant. Be concise."},
+             {"user", question}},
+            true);
 
     auto &tokenizer = SharedTestEnv::model->tokenizer();
     const auto &config = SharedTestEnv::config;
@@ -420,12 +418,10 @@ TEST_F(ModelTest, TracePrefillTokenByToken) {
 // ===========================================================================
 TEST_F(ModelTest, CompareBatchVsSequentialPrefill) {
     std::string question = "What is the capital of France?";
-    std::string prompt = "<|im_start|>system\nYou are TinyCoder, an AI coding "
-                         "assistant. Be concise.<|im_end|>\n"
-                         "<|im_start|>user\n" +
-                         question +
-                         "<|im_end|>\n"
-                         "<|im_start|>assistant\n";
+    std::string prompt = SharedTestEnv::model->formatChat(
+            {{"system", "You are TinyCoder, an AI coding assistant. Be concise."},
+             {"user", question}},
+            true);
 
     auto &tokenizer = SharedTestEnv::model->tokenizer();
     const auto &config = SharedTestEnv::config;
@@ -538,12 +534,18 @@ TEST_F(ModelTest, CompareBatchVsSequentialPrefill) {
 
     if (maxDiff < 1e-3f) {
         std::cout << "\nBatch and Sequential produce IDENTICAL results." << std::endl;
-        std::cout << "Comparing against reference (prefill):" << std::endl;
-        std::cout << "  Reference top-1: id=785 (\"The\") logit=22.8516" << std::endl;
-        std::cout << "  Our top-1: id=" << batchTop5[0].second
-                  << " logit=" << batchTop5[0].first << std::endl;
-        EXPECT_NEAR(batchTop5[0].first, 22.8516f, 5.0f)
-                << "Top-1 logit far from reference (22.8516).";
+        // Reference value check is model-specific; only check for Qwen2 0.5B
+        if (config.architecture == "qwen2" && config.hiddenSize == 1024 && config.numLayers == 24) {
+            std::cout << "Comparing against reference (prefill):" << std::endl;
+            std::cout << "  Reference top-1: id=785 (\"The\") logit=22.8516" << std::endl;
+            std::cout << "  Our top-1: id=" << batchTop5[0].second
+                      << " logit=" << batchTop5[0].first << std::endl;
+            EXPECT_NEAR(batchTop5[0].first, 22.8516f, 5.0f)
+                    << "Top-1 logit far from reference (22.8516).";
+        } else {
+            std::cout << "\n(Reference value check skipped for model: "
+                      << config.modelName << " [" << config.architecture << "])" << std::endl;
+        }
     } else {
         std::cout << "\n*** BATCH AND SEQUENTIAL DIFFER! ***" << std::endl;
         std::cout << "The batch prefill path has a bug that doesn't exist in sequential." << std::endl;
@@ -555,14 +557,7 @@ TEST_F(ModelTest, CompareBatchVsSequentialPrefill) {
             << "Batch prefill produces different top-1 token than sequential!";
 }
 
-// ---------------------------------------------------------------------------
-// SharedTestEnv static member definitions
-// ---------------------------------------------------------------------------
-
-std::string SharedTestEnv::modelPath;
-tinycoder::Model *SharedTestEnv::model = nullptr;
-bool SharedTestEnv::modelLoaded = false;
-tinycoder::ModelConfig SharedTestEnv::config;
+// SharedTestEnv static members are defined in SharedTestEnv.cpp
 
 // ---------------------------------------------------------------------------
 // Custom main: reads TINYCODER_MODEL_PATH from environment, registers the

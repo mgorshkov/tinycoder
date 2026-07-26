@@ -23,13 +23,17 @@ SOFTWARE.
 */
 
 #include "Model.hpp"
+#include "ChatTemplateRenderer.hpp"
 #include "GGMLDequantize.hpp"
 #include "LMHead.hpp"
+#include "SIMDMatMulVec.hpp"
+#include "ThreadPool.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -143,21 +147,19 @@ namespace tinycoder {
         }
 
         // Validate model architecture
-        if (config_.architecture != ARCH_QWEN2) {
+        if (!isSupportedArchitecture(config_.architecture)) {
             setError("Unsupported model architecture: \"" + config_.architecture +
-                     "\". Only \"" + ARCH_QWEN2 + "\" is supported.");
+                     "\". Supported architectures: " + ARCH_QWEN2 + ", " +
+                     ARCH_GEMMA4 + ", " + ARCH_QWEN35MOE);
             return false;
         }
 
-        // Validate model name is in the supported list
+        // Validate model name is in the supported list (optional check)
         if (!config_.modelName.empty() && !isSupportedModel(config_.modelName)) {
-            setError("Unsupported model: \"" + config_.modelName +
-                     "\". Supported models: " + MODEL_QWEN2_5_CODER_0_5B + ", " +
-                     MODEL_QWEN2_5_CODER_1_5B + ", " +
-                     MODEL_QWEN2_5_CODER_1_5B_INSTRUCT + ", " +
-                     MODEL_QWEN2_5_CODER_1_5B_INSTRUCT_GGUF + ", " +
-                     MODEL_QWEN2_5_CODER_7B_INSTRUCT);
-            return false;
+            std::cout << "[TinyCoder] Warning: model name \"" << config_.modelName
+                      << "\" not in known list, but architecture \""
+                      << config_.architecture << "\" is supported. Proceeding..."
+                      << std::endl;
         }
 
         std::cout << "[TinyCoder] Model: \"" << config_.modelName << "\" ("
@@ -181,7 +183,10 @@ namespace tinycoder {
 
         reportProgress(0.2f, "Loading tokenizer...");
 
-        // Load tokenizer from GGUF
+        // Configure tokenizer for the model architecture FIRST (sets defaults)
+        tokenizer_.configureForArchitecture(config_.architecture);
+
+        // Load tokenizer from GGUF (overrides BOS/EOS/PAD from metadata)
         if (!tokenizer_.loadFromGGUF(modelPath)) {
             std::cerr << "[TinyCoder] Failed to load tokenizer, using embedded data"
                       << std::endl;
@@ -248,6 +253,9 @@ namespace tinycoder {
 
             // GGUF stores shapes in reverse (numpy) order.
             // For a 2D tensor, shape[0] = cols, shape[1] = rows.
+            // For a 3D tensor [D0, D1, D2] in numpy → GGUF shape [D2, D1, D0]:
+            //   shape[0] = D2 (cols), shape[1] = D1, shape[2] = D0
+            //   total rows = D0 * D1 = shape[1] * shape[2]
             uint32_t rows =
                     info->shape.size() >= 2 ? static_cast<uint32_t>(info->shape[1]) : 1;
             uint32_t cols =
@@ -255,6 +263,10 @@ namespace tinycoder {
             if (info->shape.size() == 1) {
                 rows = 1;
                 cols = static_cast<uint32_t>(info->shape[0]);
+            }
+            // For 3D tensors (expert weights), multiply rows by the third dimension
+            if (info->shape.size() >= 3) {
+                rows *= static_cast<uint32_t>(info->shape[2]);
             }
 
             uint32_t blockSize = ggmlBlockSize(info->type);
@@ -387,56 +399,221 @@ namespace tinycoder {
             finalNorm_ = loadF32_1D("token_embd_norm.weight");
         }
 
-        // Load per-layer weights
+        // Load per-layer weights (architecture-aware)
         layers_.resize(config_.numLayers);
         for (uint32_t i = 0; i < config_.numLayers; ++i) {
             std::string prefix = "blk." + std::to_string(i) + ".";
 
-            // Quantized attention weights
-            layers_[i].attnQ = loadQuantized(prefix + "attn_q.weight");
-            layers_[i].attnK = loadQuantized(prefix + "attn_k.weight");
-            layers_[i].attnV = loadQuantized(prefix + "attn_v.weight");
-            layers_[i].attnO = loadQuantized(prefix + "attn_output.weight");
+            if (config_.architecture == ARCH_QWEN2) {
+                // ---- Qwen2 architecture ----
+                // Quantized attention weights
+                layers_[i].attnQ = loadQuantized(prefix + "attn_q.weight");
+                layers_[i].attnK = loadQuantized(prefix + "attn_k.weight");
+                layers_[i].attnV = loadQuantized(prefix + "attn_v.weight");
+                layers_[i].attnO = loadQuantized(prefix + "attn_output.weight");
 
-            // Dequantize attnO to F32 for exact float dot product matching the
-            // reference (llama_ref_dequant). The quantized matMulVec uses block-level
-            // fused dequantize-dot which can produce slightly different results
-            // than full dequantize + float dot product.
-            {
-                auto &qm = layers_[i].attnO;
-                uint64_t numElements = static_cast<uint64_t>(qm.rows) * qm.cols;
-                auto deq = GGMLDequantize::dequantize(qm.type, qm.data.data(), numElements);
-                layers_[i].attnO_deq = np::Array<float>(deq, np::Shape{qm.rows, qm.cols});
-            }
+                // Dequantize attnO to FP16 for exact float dot product (halves memory bandwidth vs F32)
+                {
+                    auto &qm = layers_[i].attnO;
+                    uint64_t numElements = static_cast<uint64_t>(qm.rows) * qm.cols;
+                    layers_[i].attnO_deq_f16 = GGMLDequantize::dequantizeToF16(qm.type, qm.data.data(), numElements);
+                }
 
-            // Quantized FFN weights
-            layers_[i].ffnGate = loadQuantized(prefix + "ffn_gate.weight");
-            layers_[i].ffnUp = loadQuantized(prefix + "ffn_up.weight");
-            layers_[i].ffnDown = loadQuantized(prefix + "ffn_down.weight");
+                // Quantized FFN weights (SwiGLU)
+                layers_[i].ffnGate = loadQuantized(prefix + "ffn_gate.weight");
+                layers_[i].ffnUp = loadQuantized(prefix + "ffn_up.weight");
+                layers_[i].ffnDown = loadQuantized(prefix + "ffn_down.weight");
 
-            // Dequantize ffnDown to F32 for exact float dot product matching the
-            // reference. ffnDown is Q3_K (type 11) in the Q2_K model, same as attnO.
-            {
-                auto &qm = layers_[i].ffnDown;
-                uint64_t numElements = static_cast<uint64_t>(qm.rows) * qm.cols;
-                auto deq = GGMLDequantize::dequantize(qm.type, qm.data.data(), numElements);
-                layers_[i].ffnDown_deq = np::Array<float>(deq, np::Shape{qm.rows, qm.cols});
-            }
+                // Dequantize ffnDown to FP16
+                {
+                    auto &qm = layers_[i].ffnDown;
+                    uint64_t numElements = static_cast<uint64_t>(qm.rows) * qm.cols;
+                    layers_[i].ffnDown_deq_f16 = GGMLDequantize::dequantizeToF16(qm.type, qm.data.data(), numElements);
+                }
 
-            // F32 norms (tiny, just hiddenSize elements)
-            layers_[i].rmsNormAttn = loadF32_1D(prefix + "attn_norm.weight");
-            layers_[i].rmsNormFFN = loadF32_1D(prefix + "ffn_norm.weight");
+                // Pre-pack ffnGate and ffnUp for gather-free SIMD access (Q2_K only)
+                // This eliminates the 2-bit extraction overhead in the SIMD kernel.
+                if (layers_[i].ffnGate.type == GGML_TYPE_Q2_K) {
+                    uint64_t numElements = static_cast<uint64_t>(layers_[i].ffnGate.rows) * layers_[i].ffnGate.cols;
+                    layers_[i].ffnGate.prepackedData = GGMLDequantize::prepackQ2_K(layers_[i].ffnGate.data.data(), numElements);
+                }
+                if (layers_[i].ffnUp.type == GGML_TYPE_Q2_K) {
+                    uint64_t numElements = static_cast<uint64_t>(layers_[i].ffnUp.rows) * layers_[i].ffnUp.cols;
+                    layers_[i].ffnUp.prepackedData = GGMLDequantize::prepackQ2_K(layers_[i].ffnUp.data.data(), numElements);
+                }
 
-            // F32 Q, K, V biases (Qwen2.5-Coder has these, unlike LLaMA)
-            layers_[i].attnQBias = loadF32_1D(prefix + "attn_q.bias");
-            layers_[i].attnKBias = loadF32_1D(prefix + "attn_k.bias");
-            layers_[i].attnVBias = loadF32_1D(prefix + "attn_v.bias");
+                // F32 norms
+                layers_[i].rmsNormAttn = loadF32_1D(prefix + "attn_norm.weight");
+                layers_[i].rmsNormFFN = loadF32_1D(prefix + "ffn_norm.weight");
 
-            // Validate all tensors loaded
-            if (layers_[i].attnQ.empty() || layers_[i].attnK.empty() ||
-                layers_[i].attnV.empty() || layers_[i].attnO.empty()) {
-                std::cerr << "[TinyCoder] Missing attention weights for layer " << i
-                          << std::endl;
+                // F32 Q, K, V biases (Qwen2.5-Coder has these)
+                layers_[i].attnQBias = loadF32_1D(prefix + "attn_q.bias");
+                layers_[i].attnKBias = loadF32_1D(prefix + "attn_k.bias");
+                layers_[i].attnVBias = loadF32_1D(prefix + "attn_v.bias");
+
+                // Validate all tensors loaded
+                if (layers_[i].attnQ.empty() || layers_[i].attnK.empty() ||
+                    layers_[i].attnV.empty() || layers_[i].attnO.empty()) {
+                    std::cerr << "[TinyCoder] Missing attention weights for layer " << i
+                              << std::endl;
+                    return false;
+                }
+            } else if (config_.architecture == ARCH_GEMMA4) {
+                // ---- Gemma4 architecture (dense and MoE) ----
+                // Quantized attention weights (no biases)
+                layers_[i].attnQ = loadQuantized(prefix + "attn_q.weight");
+                layers_[i].attnK = loadQuantized(prefix + "attn_k.weight");
+                layers_[i].attnV = loadQuantized(prefix + "attn_v.weight");
+                layers_[i].attnO = loadQuantized(prefix + "attn_output.weight");
+
+                // Dequantize attnO to FP16 for exact float dot product (halves memory bandwidth vs F32)
+                {
+                    auto &qm = layers_[i].attnO;
+                    uint64_t numElements = static_cast<uint64_t>(qm.rows) * qm.cols;
+                    layers_[i].attnO_deq_f16 = GGMLDequantize::dequantizeToF16(qm.type, qm.data.data(), numElements);
+                }
+
+                // Quantized FFN weights (GeGLU: gate+up, down)
+                layers_[i].ffnGate = loadQuantized(prefix + "ffn_gate.weight");
+                layers_[i].ffnUp = loadQuantized(prefix + "ffn_up.weight");
+                layers_[i].ffnDown = loadQuantized(prefix + "ffn_down.weight");
+
+                // Dequantize ffnDown to FP16
+                {
+                    auto &qm = layers_[i].ffnDown;
+                    uint64_t numElements = static_cast<uint64_t>(qm.rows) * qm.cols;
+                    layers_[i].ffnDown_deq_f16 = GGMLDequantize::dequantizeToF16(qm.type, qm.data.data(), numElements);
+                }
+
+                // Pre-pack ffnGate and ffnUp for gather-free SIMD access (Q2_K only)
+                if (layers_[i].ffnGate.type == GGML_TYPE_Q2_K) {
+                    uint64_t numElements = static_cast<uint64_t>(layers_[i].ffnGate.rows) * layers_[i].ffnGate.cols;
+                    layers_[i].ffnGate.prepackedData = GGMLDequantize::prepackQ2_K(layers_[i].ffnGate.data.data(), numElements);
+                }
+                if (layers_[i].ffnUp.type == GGML_TYPE_Q2_K) {
+                    uint64_t numElements = static_cast<uint64_t>(layers_[i].ffnUp.rows) * layers_[i].ffnUp.cols;
+                    layers_[i].ffnUp.prepackedData = GGMLDequantize::prepackQ2_K(layers_[i].ffnUp.data.data(), numElements);
+                }
+
+                // F32 norms
+                layers_[i].rmsNormAttn = loadF32_1D(prefix + "attn_norm.weight");
+                layers_[i].rmsNormFFN = loadF32_1D(prefix + "ffn_norm.weight");
+
+                // Gemma4-specific: Q/K norms (RMSNorm before RoPE)
+                layers_[i].attnQNorm = loadF32_1D(prefix + "attn_q_norm.weight");
+                layers_[i].attnKNorm = loadF32_1D(prefix + "attn_k_norm.weight");
+
+                // Gemma4-specific: post-attention and post-FFW norms
+                layers_[i].postAttnNorm = loadF32_1D(prefix + "post_attention_norm.weight");
+                layers_[i].postFFWNorm = loadF32_1D(prefix + "post_ffw_norm.weight");
+
+                // Gemma4-specific: layer output scale
+                layers_[i].layerOutputScale = loadF32_1D(prefix + "layer_output_scale.weight");
+
+                // Gemma4 MoE-specific weights
+                if (config_.expertCount > 0) {
+                    // Expert router
+                    layers_[i].ffnGateInp = loadQuantized(prefix + "ffn_gate_inp.weight");
+                    // Expert scales (loaded as F32 1D)
+                    {
+                        auto info = loader.getTensorInfo(prefix + "ffn_gate_inp.scale");
+                        if (info) {
+                            const uint8_t *data = loader.getTensor(prefix + "ffn_gate_inp.scale");
+                            if (data) {
+                                uint32_t n = static_cast<uint32_t>(info->shape[0]);
+                                std::vector<float> vec(n);
+                                std::memcpy(vec.data(), data, n * sizeof(float));
+                                // Store in layerOutputScale (reuse field)
+                                // ffn_gate_inp.scale is a per-expert scale factor
+                            }
+                        }
+                    }
+                    // Fused gate+up expert weights: [expertCount, expertFF * 2, hiddenSize]
+                    layers_[i].ffnGateUpExps = loadQuantized(prefix + "ffn_gate_up_exps.weight");
+                    // Down expert weights: [expertCount, hiddenSize, expertFF]
+                    layers_[i].ffnDownExps = loadQuantized(prefix + "ffn_down_exps.weight");
+
+                    // Additional norms for MoE
+                    layers_[i].preFFWNorm2 = loadF32_1D(prefix + "pre_ffw_norm_2.weight");
+                    layers_[i].postFFWNorm1 = loadF32_1D(prefix + "post_ffw_norm_1.weight");
+                    layers_[i].postFFWNorm2 = loadF32_1D(prefix + "post_ffw_norm_2.weight");
+                }
+
+                // Validate all tensors loaded
+                if (layers_[i].attnQ.empty() || layers_[i].attnK.empty() ||
+                    layers_[i].attnV.empty() || layers_[i].attnO.empty()) {
+                    std::cerr << "[TinyCoder] Missing attention weights for layer " << i
+                              << std::endl;
+                    return false;
+                }
+            } else if (config_.architecture == ARCH_QWEN35MOE) {
+                // ---- Qwen35MoE architecture (MoE + SSM + MTP) ----
+                // Quantized attention weights (separate Q, K, V)
+                layers_[i].attnQ = loadQuantized(prefix + "attn_q.weight");
+                layers_[i].attnK = loadQuantized(prefix + "attn_k.weight");
+                layers_[i].attnV = loadQuantized(prefix + "attn_v.weight");
+                layers_[i].attnO = loadQuantized(prefix + "attn_output.weight");
+
+                // Dequantize attnO to FP16 for exact float dot product (halves memory bandwidth vs F32)
+                {
+                    auto &qm = layers_[i].attnO;
+                    uint64_t numElements = static_cast<uint64_t>(qm.rows) * qm.cols;
+                    layers_[i].attnO_deq_f16 = GGMLDequantize::dequantizeToF16(qm.type, qm.data.data(), numElements);
+                }
+
+                // Fused QKV projection (optional, may not be present in all layers)
+                layers_[i].attnQKV = loadQuantized(prefix + "attn_qkv.weight");
+
+                // Attention gate (element-wise gating for attention output)
+                layers_[i].attnGate = loadQuantized(prefix + "attn_gate.weight");
+
+                // Q/K norms (RMSNorm before RoPE)
+                layers_[i].attnQNormMoe = loadF32_1D(prefix + "attn_q_norm.weight");
+                layers_[i].attnKNormMoe = loadF32_1D(prefix + "attn_k_norm.weight");
+
+                // F32 norms
+                layers_[i].rmsNormAttn = loadF32_1D(prefix + "attn_norm.weight");
+                layers_[i].postAttnNorm = loadF32_1D(prefix + "post_attention_norm.weight");
+
+                // ---- SSM (Mamba-style) weights ----
+                layers_[i].ssmConv1d = loadQuantized(prefix + "ssm_conv1d.weight");
+                layers_[i].ssmOut = loadQuantized(prefix + "ssm_out.weight");
+                layers_[i].ssmA = loadF32_1D(prefix + "ssm_a");
+                layers_[i].ssmDtBias = loadF32_1D(prefix + "ssm_dt.bias");
+                layers_[i].ssmAlpha = loadF32_1D(prefix + "ssm_alpha.weight");
+                layers_[i].ssmBeta = loadF32_1D(prefix + "ssm_beta.weight");
+                layers_[i].ssmNorm = loadF32_1D(prefix + "ssm_norm.weight");
+
+                // ---- MoE FFN weights ----
+                // Expert router
+                layers_[i].ffnGateInpMoe = loadQuantized(prefix + "ffn_gate_inp.weight");
+                // Expert weights (gate, up, down)
+                layers_[i].ffnGateExps = loadQuantized(prefix + "ffn_gate_exps.weight");
+                layers_[i].ffnUpExps = loadQuantized(prefix + "ffn_up_exps.weight");
+                layers_[i].ffnDownExpsMoe = loadQuantized(prefix + "ffn_down_exps.weight");
+
+                // Shared expert weights
+                layers_[i].ffnGateInpShexp = loadQuantized(prefix + "ffn_gate_inp_shexp.weight");
+                layers_[i].ffnGateShexp = loadQuantized(prefix + "ffn_gate_shexp.weight");
+                layers_[i].ffnUpShexp = loadQuantized(prefix + "ffn_up_shexp.weight");
+                layers_[i].ffnDownShexp = loadQuantized(prefix + "ffn_down_shexp.weight");
+
+                // ---- MTP (Multi-Token Prediction) weights ----
+                layers_[i].nextnEhProj = loadQuantized(prefix + "nextn.eh_proj.weight");
+                layers_[i].nextnEnorm = loadF32_1D(prefix + "nextn.enorm.weight");
+                layers_[i].nextnHnorm = loadF32_1D(prefix + "nextn.hnorm.weight");
+                layers_[i].nextnSharedHeadNorm = loadF32_1D(prefix + "nextn.shared_head_norm.weight");
+
+                // Validate core tensors loaded
+                if (layers_[i].attnQ.empty() || layers_[i].attnK.empty() ||
+                    layers_[i].attnV.empty() || layers_[i].attnO.empty()) {
+                    std::cerr << "[TinyCoder] Missing attention weights for layer " << i
+                              << std::endl;
+                    return false;
+                }
+            } else {
+                std::cerr << "[TinyCoder] Unknown architecture: " << config_.architecture
+                          << " for layer " << i << std::endl;
                 return false;
             }
         }
@@ -466,6 +643,31 @@ namespace tinycoder {
         kvCache_.k = np::Array<float>(np::Shape{nLayers, maxSeq, nKVHeads, headDim});
         kvCache_.v = np::Array<float>(np::Shape{nLayers, maxSeq, nKVHeads, headDim});
         kvCache_.pos = 0;
+
+        // Initialize SSM state for Qwen35MoE architecture
+        if (config_.architecture == ARCH_QWEN35MOE && config_.ssmInnerSize > 0) {
+            uint32_t ssmConvKernel = config_.ssmConvKernel;
+            uint32_t ssmStateSize = config_.ssmStateSize;
+            uint32_t ssmInnerSize = config_.ssmInnerSize;
+
+            kvCache_.ssmConvBuf.resize(nLayers);
+            kvCache_.ssmState.resize(nLayers);
+            for (uint32_t i = 0; i < nLayers; ++i) {
+                // Conv buffer: store (ssmConvKernel - 1) past inputs, each of size ssmInnerSize
+                if (ssmConvKernel > 1) {
+                    kvCache_.ssmConvBuf[i].resize((ssmConvKernel - 1) * ssmInnerSize, 0.0f);
+                }
+                // SSM state: ssmInnerSize x ssmStateSize
+                kvCache_.ssmState[i].resize(ssmInnerSize * ssmStateSize, 0.0f);
+            }
+
+            uint64_t ssmMemBytes = static_cast<uint64_t>(nLayers) * ssmInnerSize *
+                                   (ssmConvKernel + ssmStateSize) * sizeof(float);
+            std::cout << "[TinyCoder] SSM state: " << nLayers << " layers x "
+                      << ssmInnerSize << " inner x " << ssmStateSize << " state + "
+                      << ssmConvKernel << " conv = " << (ssmMemBytes / (1024 * 1024)) << " MB"
+                      << std::endl;
+        }
 
         return true;
     }
@@ -524,28 +726,20 @@ namespace tinycoder {
         // Zero out KV cache tensors to prevent residual data from previous generations
         std::fill(kvCache_.k.data(), kvCache_.k.data() + kvCache_.k.size(), 0.0f);
         std::fill(kvCache_.v.data(), kvCache_.v.data() + kvCache_.v.size(), 0.0f);
+
+        // Clear SSM state for Qwen35MoE architecture
+        for (auto &buf: kvCache_.ssmConvBuf) {
+            std::fill(buf.begin(), buf.end(), 0.0f);
+        }
+        for (auto &state: kvCache_.ssmState) {
+            std::fill(state.begin(), state.end(), 0.0f);
+        }
     }
 
     void Model::rmsNormInPlace(const float *x, float *out, const float *weight,
-                               uint32_t n, float eps) {
-        // Compute RMSNorm for a single vector of length n.
-        // x: input vector
-        // out: output vector (can alias x)
-        // weight: scale vector of length n
-        //
-        // Use double precision for sumSq accumulation to match the
-        // reference implementation and avoid precision loss with large n.
-
-        double sumSq = 0.0;
-        for (uint32_t i = 0; i < n; ++i) {
-            sumSq += (double) x[i] * (double) x[i];
-        }
-        float rms = std::sqrt((float) (sumSq / (double) n) + eps);
-        float invRms = 1.0f / rms;
-
-        for (uint32_t i = 0; i < n; ++i) {
-            out[i] = x[i] * invRms * weight[i];
-        }
+                               uint32_t n, float eps) const {
+        // Delegate to SIMD-accelerated rmsNormSIMD
+        rmsNormSIMD(x, out, weight, n);
     }
 
     void Model::applyRoPE(float *q, float *k, uint32_t qSeqLen, uint32_t kSeqLen,
@@ -618,71 +812,66 @@ namespace tinycoder {
         // Each thread needs its own local scores buffer to avoid data races.
         // We use a thread-local stack buffer (no per-call heap alloc).
         // Head dim is 128, nHeads=12, nKVHeads=2, nGroups=6.
-        // Parallelize over (s, g) pairs: collapse(2) on seqLen × nKVHeads avoids
-        // intervening declarations that would prevent collapse(3).
+        // Parallelize over (s, g) pairs using the thread pool.
+        // Flatten the 2D iteration space into 1D.
         constexpr uint32_t STACK_SCORE_LIMIT = 4096;
 
-#pragma omp parallel for collapse(2) schedule(static)
-        for (uint32_t s = 0; s < seqLen; ++s) {
-            for (uint32_t g = 0; g < nKVHeads; ++g) {
-                // Causal mask: this query token can only attend to cache positions
-                // up to (cachePos + s), which is its own position in the cache.
-                // Positions beyond that are future tokens that haven't been generated yet.
-                uint32_t csEnd = cachePos + s;// inclusive end position
+        ThreadPool::instance().parallelFor2D(seqLen, nKVHeads,
+                                             [&](uint32_t s, uint32_t g) {
+                                                 // Causal mask: this query token can only attend to cache positions
+                                                 // up to (cachePos + s), which is its own position in the cache.
+                                                 // Positions beyond that are future tokens that haven't been generated yet.
+                                                 uint32_t csEnd = cachePos + s;// inclusive end position
 
-                for (uint32_t h = 0; h < nGroups; ++h) {
-                    // Each thread gets its own local scores buffer on the stack.
-                    // For cacheLen up to 2048, this is ~8KB — well within stack limits.
-                    float localScores[STACK_SCORE_LIMIT];
+                                                 for (uint32_t h = 0; h < nGroups; ++h) {
+                                                     // Each thread gets its own local scores buffer on the stack.
+                                                     // For cacheLen up to 2048, this is ~8KB — well within stack limits.
+                                                     float localScores[STACK_SCORE_LIMIT];
 
-                    uint32_t qHead = g * nGroups + h;
-                    const float *qPtr = q + (s * nHeads * headDim + qHead * headDim);
+                                                     uint32_t qHead = g * nGroups + h;
+                                                     const float *qPtr = q + (s * nHeads * headDim + qHead * headDim);
 
-                    // Compute scores for this query head against allowed cached keys
-                    // Use double-precision accumulation, then store as float (matching reference)
-                    float maxScore = -1e30f;
-                    for (uint32_t cs = 0; cs <= csEnd; ++cs) {
-                        const float *kPtr = kCache + (cs * nKVHeads * headDim + g * headDim);
-                        double score = 0.0;
-                        for (uint32_t d = 0; d < headDim; ++d) {
-                            score += static_cast<double>(qPtr[d]) * static_cast<double>(kPtr[d]);
-                        }
-                        localScores[cs] = static_cast<float>(static_cast<double>(score) * static_cast<double>(invSqrtHeadDim));
-                        if (localScores[cs] > maxScore)
-                            maxScore = localScores[cs];
-                    }
-                    // Mask out future positions (set to -infinity before softmax)
-                    for (uint32_t cs = csEnd + 1; cs < cacheLen; ++cs) {
-                        localScores[cs] = -std::numeric_limits<float>::infinity();
-                    }
+                                                     // Compute scores for this query head against allowed cached keys
+                                                     // Use SIMD-accelerated dot product
+                                                     float maxScore = -1e30f;
+                                                     for (uint32_t cs = 0; cs <= csEnd; ++cs) {
+                                                         const float *kPtr = kCache + (cs * nKVHeads * headDim + g * headDim);
+                                                         float score = dotProductFMA(qPtr, kPtr, headDim) * invSqrtHeadDim;
+                                                         localScores[cs] = score;
+                                                         if (score > maxScore)
+                                                             maxScore = score;
+                                                     }
+                                                     // Mask out future positions (set to -infinity before softmax)
+                                                     for (uint32_t cs = csEnd + 1; cs < cacheLen; ++cs) {
+                                                         localScores[cs] = -std::numeric_limits<float>::infinity();
+                                                     }
 
-                    // Softmax: compute sumExp in double from float scores (matching reference)
-                    double sumExp = 0.0;
-                    for (uint32_t cs = 0; cs < cacheLen; ++cs) {
-                        sumExp += static_cast<double>(std::exp(static_cast<double>(localScores[cs] - maxScore)));
-                    }
-                    float invSumExp = static_cast<float>(1.0 / sumExp);
+                                                     // Softmax: compute sumExp in double from float scores (matching reference)
+                                                     double sumExp = 0.0;
+                                                     for (uint32_t cs = 0; cs < cacheLen; ++cs) {
+                                                         sumExp += static_cast<double>(std::exp(static_cast<double>(localScores[cs] - maxScore)));
+                                                     }
+                                                     float invSumExp = static_cast<float>(1.0 / sumExp);
 
-                    // Weighted sum of values: recompute softmax probabilities from float scores
-                    // (matching reference behavior exactly)
-                    float *outPtr = output + (s * nHeads * headDim + qHead * headDim);
-                    for (uint32_t d = 0; d < headDim; ++d) {
-                        double val = 0.0;
-                        for (uint32_t cs = 0; cs < cacheLen; ++cs) {
-                            // Match reference exactly:
-                            //   float sv = std::exp((double)(scores[p] - maxScore)) * invSumExp;
-                            //   This is: double * float -> double, then truncated to float
-                            //   sum += (double)sv * (double)v_cache[...];
-                            double expVal = std::exp(static_cast<double>(localScores[cs] - maxScore));
-                            float sv = static_cast<float>(expVal * static_cast<double>(invSumExp));
-                            val += static_cast<double>(sv) *
-                                   static_cast<double>(vCache[cs * nKVHeads * headDim + g * headDim + d]);
-                        }
-                        outPtr[d] = std::isinf(val) ? 0.0f : (std::isnan(val) ? 0.0f : static_cast<float>(val));
-                    }
-                }
-            }
-        }
+                                                     // Weighted sum of values: recompute softmax probabilities from float scores
+                                                     // (matching reference behavior exactly)
+                                                     float *outPtr = output + (s * nHeads * headDim + qHead * headDim);
+                                                     for (uint32_t d = 0; d < headDim; ++d) {
+                                                         double val = 0.0;
+                                                         for (uint32_t cs = 0; cs < cacheLen; ++cs) {
+                                                             // Match reference exactly:
+                                                             //   float sv = std::exp((double)(scores[p] - maxScore)) * invSumExp;
+                                                             //   This is: double * float -> double, then truncated to float
+                                                             //   sum += (double)sv * (double)v_cache[...];
+                                                             double expVal = std::exp(static_cast<double>(localScores[cs] - maxScore));
+                                                             float sv = static_cast<float>(expVal * static_cast<double>(invSumExp));
+                                                             val += static_cast<double>(sv) *
+                                                                    static_cast<double>(vCache[cs * nKVHeads * headDim + g * headDim + d]);
+                                                         }
+                                                         outPtr[d] = std::isinf(val) ? 0.0f : (std::isnan(val) ? 0.0f : static_cast<float>(val));
+                                                     }
+                                                 }
+                                             });
     }
 
     void Model::siluInPlace(float *x, uint32_t n) {
@@ -699,8 +888,298 @@ namespace tinycoder {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Debug: dump vector stats (first 8, min, max, mean)
+    void Model::geluInPlace(float *x, uint32_t n) const {
+        // GeLU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        constexpr float sqrt2OverPi = 0.7978845608028654f;// sqrt(2.0 / M_PI)
+        for (uint32_t i = 0; i < n; ++i) {
+            float x3 = x[i] * x[i] * x[i];
+            x[i] = 0.5f * x[i] * (1.0f + std::tanh(sqrt2OverPi * (x[i] + 0.044715f * x3)));
+        }
+    }
+
+    void Model::softcapInPlace(float *x, uint32_t n, float cap) {
+        // tanh(x / cap) * cap
+        if (cap > 0.0f) {
+            float invCap = 1.0f / cap;
+            for (uint32_t i = 0; i < n; ++i) {
+                x[i] = std::tanh(x[i] * invCap) * cap;
+            }
+        }
+    }
+
+    void Model::applyQKNorms(float *q, float *k, uint32_t seqLen,
+                             uint32_t qHeads, uint32_t kHeads,
+                             const float *qNorm, const float *kNorm) {
+        // Per-head RMSNorm applied to Q and K before RoPE.
+        // q layout: [seqLen, qHeads, headDim]
+        // k layout: [seqLen, kHeads, headDim]
+        // qNorm/kNorm: [headDim] (shared across all heads)
+        uint32_t headDim = config_.headDim;
+        for (uint32_t s = 0; s < seqLen; ++s) {
+            for (uint32_t h = 0; h < qHeads; ++h) {
+                float *qHead = q + (s * qHeads + h) * headDim;
+                rmsNormInPlace(qHead, qHead, qNorm, headDim);
+            }
+            for (uint32_t h = 0; h < kHeads; ++h) {
+                float *kHead = k + (s * kHeads + h) * headDim;
+                rmsNormInPlace(kHead, kHead, kNorm, headDim);
+            }
+        }
+    }
+
+    void Model::computeGemma4MoE(const float *ffnNorm, float *ffnOut,
+                                 uint32_t seqLen, uint32_t hiddenSize,
+                                 uint32_t intermediateSize,
+                                 const LayerWeights &w) const {
+        // Gemma4 MoE FFN with top-k expert routing.
+        //
+        // Architecture:
+        //   1. Second pre-FFN norm (preFFWNorm2) applied to input
+        //   2. Router (ffnGateInp) computes expert scores
+        //   3. Top-k experts selected (k = expertUsedCount)
+        //   4. For each selected expert:
+        //      a. Gate+Up projection from ffnGateUpExps (fused gate+up per expert)
+        //      b. GeGLU activation: gelu(gate) * up
+        //      c. Down projection from ffnDownExps
+        //   5. Weighted sum of expert outputs by routing probabilities
+        //   6. Post-FFN norm 1 (postFFWNorm1)
+        //   7. Post-FFN norm 2 (postFFWNorm2)
+        //
+        // Tensor layouts (after loadQuantized handles 3D→2D flattening):
+        //   ffnGateUpExps: [expertCount * expertFF * 2, hiddenSize]
+        //     - Expert e: rows [e * expertFF * 2, (e+1) * expertFF * 2)
+        //       - Gate: rows [e * expertFF * 2, e * expertFF * 2 + expertFF)
+        //       - Up:   rows [e * expertFF * 2 + expertFF, (e+1) * expertFF * 2)
+        //   ffnDownExps: [expertCount * hiddenSize, expertFF]
+        //     - Expert e: rows [e * hiddenSize, (e+1) * hiddenSize)
+        //   ffnGateInp: [hiddenSize, expertCount] (router)
+
+        uint32_t expertCount = config_.expertCount;
+        uint32_t expertUsedCount = config_.expertUsedCount;
+        uint32_t expertFF = config_.expertFeedForwardLength;
+
+        if (expertCount == 0 || expertUsedCount == 0) {
+            std::cerr << "[TinyCoder] computeGemma4MoE: MoE not configured" << std::endl;
+            return;
+        }
+
+        // Temporary buffers per token
+        std::vector<float> routerScores(expertCount);
+        std::vector<float> gateBuf(expertFF);
+        std::vector<float> upBuf(expertFF);
+        std::vector<float> expertOut(hiddenSize);
+
+        for (uint32_t s = 0; s < seqLen; ++s) {
+            const float *inputPtr = ffnNorm + s * hiddenSize;
+
+            // Step 1: Apply second pre-FFN norm (preFFWNorm2)
+            std::vector<float> normedInput(hiddenSize);
+            if (!w.preFFWNorm2.empty()) {
+                rmsNormInPlace(inputPtr, normedInput.data(), w.preFFWNorm2.data(), hiddenSize);
+            } else {
+                std::memcpy(normedInput.data(), inputPtr, hiddenSize * sizeof(float));
+            }
+
+            // Step 2: Router - compute expert scores
+            np::Array<float> routerOut = w.ffnGateInp.matMulVec(normedInput.data());
+            std::memcpy(routerScores.data(), routerOut.data(), expertCount * sizeof(float));
+
+            // Step 3: Select top-k experts
+            // Build list of (score, expert_idx) pairs
+            std::vector<std::pair<float, uint32_t>> scoredExperts(expertCount);
+            for (uint32_t e = 0; e < expertCount; ++e) {
+                scoredExperts[e] = {routerScores[e], e};
+            }
+            // Partial sort to get top-k
+            std::partial_sort(scoredExperts.begin(), scoredExperts.begin() + expertUsedCount,
+                              scoredExperts.end(),
+                              [](const auto &a, const auto &b) { return a.first > b.first; });
+
+            // Step 4-5: Compute expert outputs and combine
+            std::fill(expertOut.begin(), expertOut.end(), 0.0f);
+
+            for (uint32_t r = 0; r < expertUsedCount; ++r) {
+                uint32_t expertIdx = scoredExperts[r].second;
+                float routingWeight = scoredExperts[r].first;
+
+                // Step 4a: Gate+Up projection for this expert
+                // Gate: rows [expertIdx * expertFF * 2, expertIdx * expertFF * 2 + expertFF)
+                np::Array<float> gateRow = w.ffnGateUpExps.matMulVecRows(
+                        normedInput.data(),
+                        expertIdx * expertFF * 2,
+                        expertFF);
+                std::memcpy(gateBuf.data(), gateRow.data(), expertFF * sizeof(float));
+
+                // Up: rows [expertIdx * expertFF * 2 + expertFF, (expertIdx+1) * expertFF * 2)
+                np::Array<float> upRow = w.ffnGateUpExps.matMulVecRows(
+                        normedInput.data(),
+                        expertIdx * expertFF * 2 + expertFF,
+                        expertFF);
+                std::memcpy(upBuf.data(), upRow.data(), expertFF * sizeof(float));
+
+                // Step 4b: GeGLU activation: gelu(gate) * up
+                geluInPlace(gateBuf.data(), expertFF);
+                for (uint32_t i = 0; i < expertFF; ++i) {
+                    gateBuf[i] *= upBuf[i];
+                }
+
+                // Step 4c: Down projection for this expert
+                // rows [expertIdx * hiddenSize, (expertIdx+1) * hiddenSize)
+                np::Array<float> downRow = w.ffnDownExps.matMulVecRows(
+                        gateBuf.data(),
+                        expertIdx * hiddenSize,
+                        hiddenSize);
+
+                // Step 5: Weighted sum (routing weight * expert output)
+                float weight = routingWeight;
+                for (uint32_t i = 0; i < hiddenSize; ++i) {
+                    expertOut[i] += weight * downRow.data()[i];
+                }
+            }
+
+            // Step 6-7: Post-FFN norms
+            float *outPtr = ffnOut + s * hiddenSize;
+            if (!w.postFFWNorm1.empty()) {
+                rmsNormInPlace(expertOut.data(), outPtr, w.postFFWNorm1.data(), hiddenSize);
+            } else {
+                std::memcpy(outPtr, expertOut.data(), hiddenSize * sizeof(float));
+            }
+            if (!w.postFFWNorm2.empty()) {
+                rmsNormInPlace(outPtr, outPtr, w.postFFWNorm2.data(), hiddenSize);
+            }
+        }
+    }
+
+    void Model::computeQwen35MoE(const float *ffnNorm, float *ffnOut,
+                                 uint32_t seqLen, uint32_t hiddenSize,
+                                 uint32_t intermediateSize,
+                                 const LayerWeights &w) const {
+        // Qwen35MoE MoE FFN with top-k expert routing + shared expert.
+        //
+        // Architecture:
+        //   1. Router (ffnGateInpMoe) computes expert scores
+        //   2. Top-k experts selected (k = expertUsedCount)
+        //   3. For each selected expert:
+        //      a. Gate projection from ffnGateExps
+        //      b. Up projection from ffnUpExps
+        //      c. SwiGLU activation: silu(gate) * up
+        //      d. Down projection from ffnDownExpsMoe
+        //   4. Shared expert (ffnGateShexp, ffnUpShexp, ffnDownShexp) with router (ffnGateInpShexp)
+        //   5. Weighted sum of expert outputs + shared expert output
+        //
+        // Tensor layouts (after loadQuantized handles 3D→2D flattening):
+        //   ffnGateExps: [expertCount * expertFF, hiddenSize]
+        //     - Expert e: rows [e * expertFF, (e+1) * expertFF)
+        //   ffnUpExps: [expertCount * expertFF, hiddenSize]
+        //     - Expert e: rows [e * expertFF, (e+1) * expertFF)
+        //   ffnDownExpsMoe: [expertCount * hiddenSize, expertFF]
+        //     - Expert e: rows [e * hiddenSize, (e+1) * hiddenSize)
+        //   ffnGateInpMoe: [hiddenSize, expertCount] (router)
+
+        uint32_t expertCount = config_.expertCount;
+        uint32_t expertUsedCount = config_.expertUsedCount;
+        uint32_t expertFF = config_.expertFeedForwardLength;
+        uint32_t sharedExpertFF = config_.expertSharedFeedForwardLength;
+
+        if (expertCount == 0 || expertUsedCount == 0) {
+            std::cerr << "[TinyCoder] computeQwen35MoE: MoE not configured" << std::endl;
+            return;
+        }
+
+        // Temporary buffers per token
+        std::vector<float> routerScores(expertCount);
+        std::vector<float> gateBuf(expertFF);
+        std::vector<float> upBuf(expertFF);
+        std::vector<float> expertOut(hiddenSize);
+
+        for (uint32_t s = 0; s < seqLen; ++s) {
+            const float *inputPtr = ffnNorm + s * hiddenSize;
+
+            // Step 1: Router - compute expert scores
+            np::Array<float> routerOut = w.ffnGateInpMoe.matMulVec(inputPtr);
+            std::memcpy(routerScores.data(), routerOut.data(), expertCount * sizeof(float));
+
+            // Step 2: Select top-k experts
+            std::vector<std::pair<float, uint32_t>> scoredExperts(expertCount);
+            for (uint32_t e = 0; e < expertCount; ++e) {
+                scoredExperts[e] = {routerScores[e], e};
+            }
+            std::partial_sort(scoredExperts.begin(), scoredExperts.begin() + expertUsedCount,
+                              scoredExperts.end(),
+                              [](const auto &a, const auto &b) { return a.first > b.first; });
+
+            // Step 3-5: Compute expert outputs and combine
+            std::fill(expertOut.begin(), expertOut.end(), 0.0f);
+
+            for (uint32_t r = 0; r < expertUsedCount; ++r) {
+                uint32_t expertIdx = scoredExperts[r].second;
+                float routingWeight = scoredExperts[r].first;
+
+                // Gate projection for this expert
+                {
+                    np::Array<float> gateRow = w.ffnGateExps.matMulVecRows(
+                            inputPtr, expertIdx * expertFF, expertFF);
+                    std::memcpy(gateBuf.data(), gateRow.data(), expertFF * sizeof(float));
+                }
+
+                // Up projection for this expert
+                {
+                    np::Array<float> upRow = w.ffnUpExps.matMulVecRows(
+                            inputPtr, expertIdx * expertFF, expertFF);
+                    std::memcpy(upBuf.data(), upRow.data(), expertFF * sizeof(float));
+                }
+
+                // SwiGLU activation: silu(gate) * up
+                for (uint32_t i = 0; i < expertFF; ++i) {
+                    gateBuf[i] = (gateBuf[i] / (1.0f + std::exp(-gateBuf[i]))) * upBuf[i];
+                }
+
+                // Down projection for this expert
+                {
+                    np::Array<float> downRow = w.ffnDownExpsMoe.matMulVecRows(
+                            gateBuf.data(), expertIdx * hiddenSize, hiddenSize);
+                    // Weighted sum into expertOut
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        expertOut[i] += routingWeight * downRow.data()[i];
+                    }
+                }
+            }
+
+            // Shared expert
+            if (!w.ffnGateShexp.empty() && !w.ffnUpShexp.empty() && !w.ffnDownShexp.empty()) {
+                // Shared expert router (sigmoid gate)
+                float sharedGateWeight = 1.0f;
+                if (!w.ffnGateInpShexp.empty()) {
+                    np::Array<float> sharedRouterOut = w.ffnGateInpShexp.matMulVec(inputPtr);
+                    sharedGateWeight = sharedRouterOut.data()[0];
+                    sharedGateWeight = 1.0f / (1.0f + std::exp(-sharedGateWeight));// sigmoid
+                }
+
+                // Shared expert gate projection
+                np::Array<float> sharedGate = w.ffnGateShexp.matMulVec(inputPtr);
+                // Shared expert up projection
+                np::Array<float> sharedUp = w.ffnUpShexp.matMulVec(inputPtr);
+
+                // SwiGLU: silu(gate) * up
+                for (uint32_t i = 0; i < sharedExpertFF; ++i) {
+                    sharedGate.data()[i] = (sharedGate.data()[i] / (1.0f + std::exp(-sharedGate.data()[i]))) * sharedUp.data()[i];
+                }
+
+                // Shared expert down projection
+                np::Array<float> sharedDown = w.ffnDownShexp.matMulVec(sharedGate.data());
+
+                // Add weighted shared expert output
+                for (uint32_t i = 0; i < hiddenSize; ++i) {
+                    expertOut[i] += sharedGateWeight * sharedDown.data()[i];
+                }
+            }
+
+            // Write output
+            float *outPtr = ffnOut + s * hiddenSize;
+            std::memcpy(outPtr, expertOut.data(), hiddenSize * sizeof(float));
+        }
+    }
+
     // -----------------------------------------------------------------------
     namespace {
         void dumpVecStats(const float *v, uint32_t n, const std::string &label) {
@@ -717,35 +1196,142 @@ namespace tinycoder {
                       << " mean=" << (sumV / static_cast<float>(n)) << std::endl;
         }
 
-        /// @brief Compute y = x * W using dequantized F32 weights (exact float dot product).
-        /// This matches the reference implementation in llama_ref_dequant.cpp's mat_mul_vec().
-        /// Used for weights that are Q3_K quantized in the Q2_K model (attnO, ffnDown) -
-        /// the block-level fused dequantize-dot in matMulVecFused produces slightly different
-        /// results than full dequantize + float dot product, and this difference compounds
-        /// through RMSNorm to produce large divergences in subsequent layers.
-        /// @param W Dequantized F32 weight matrix, stored row-major: W[j][i] = data[j * cols + i]
-        /// @param x Input vector of size cols
-        /// @param rows Number of rows (output dimension)
-        /// @param cols Number of columns (input dimension)
-        /// @return Output vector of size rows as np::Array<float>
+        // Forward declaration of out-parameter version needed by return-value version
+        void deqMatMulVec(const float *W, const float *x,
+                          uint32_t rows, uint32_t cols, float *out);
+
         np::Array<float> deqMatMulVec(const float *W, const float *x,
                                       uint32_t rows, uint32_t cols) {
+            // Allocate result and delegate to the out-parameter version
             np::Array<float> result(np::Shape{rows});
-            float *resultData = result.data();
-            // Parallelize over output rows: each row W[j] dot x is independent.
-            // rows = hiddenSize (1536) for attnO, or intermediateSize (8960) for ffnDown.
-#pragma omp parallel for schedule(static)
-            for (uint32_t j = 0; j < rows; ++j) {
-                double dot = 0.0;
-                const float *Wrow = W + static_cast<size_t>(j) * cols;
-                for (uint32_t i = 0; i < cols; ++i) {
-                    dot += static_cast<double>(x[i]) * Wrow[i];
-                }
-                resultData[j] = static_cast<float>(dot);
-            }
+            deqMatMulVec(W, x, rows, cols, result.data());
             return result;
         }
+
+        void deqMatMulVec(const float *W, const float *x,
+                          uint32_t rows, uint32_t cols, float *out) {
+            // This function is ALWAYS called from within a ThreadPool::parallelFor
+            // lambda (attention output projection, FFN down projection).
+            // Using ThreadPool::parallelFor here would trigger the re-entrancy
+            // guard and execute sequentially anyway, but with significant overhead
+            // from waking/synchronizing idle workers.
+            // Instead, use a plain sequential loop.
+            for (uint32_t j = 0; j < rows; ++j) {
+                const float *Wrow = W + static_cast<size_t>(j) * cols;
+                out[j] = dotProductFMA(x, Wrow, cols);
+            }
+        }
+
+        // Forward declaration of out-parameter version needed by return-value version
+        static void deqMatMulVecF16(const uint16_t *W_f16, const float *x,
+                                    uint32_t rows, uint32_t cols, float *out);
+
+        /// @brief Matrix-vector multiply with FP16-stored weights (return-value version).
+        ///
+        /// Computes y_j = sum_i x[i] * W_f16[j][i] for j in [0, rows).
+        /// W_f16 is stored as FP16 (uint16_t) to halve memory bandwidth.
+        /// Uses F16C _mm256_cvtph_ps for on-the-fly FP16->FP32 conversion.
+        static np::Array<float> deqMatMulVecF16(const uint16_t *W_f16, const float *x,
+                                                uint32_t rows, uint32_t cols) {
+            np::Array<float> result(np::Shape{rows});
+            deqMatMulVecF16(W_f16, x, rows, cols, result.data());
+            return result;
+        }
+
+        /// @brief Matrix-vector multiply with FP16-stored weights (out-parameter version).
+        ///
+        /// Computes y_j = sum_i x[i] * W_f16[j][i] for j in [0, rows).
+        /// W_f16 is stored as FP16 (uint16_t) to halve memory bandwidth.
+        /// Uses F16C _mm256_cvtph_ps for on-the-fly FP16->FP32 conversion.
+        ///
+        /// This function is ALWAYS called from within a ThreadPool::parallelFor
+        /// lambda, so it uses a plain sequential loop (no nested parallelFor).
+        static void deqMatMulVecF16(const uint16_t *W_f16, const float *x,
+                                    uint32_t rows, uint32_t cols, float *out) {
+            for (uint32_t j = 0; j < rows; ++j) {
+                const uint16_t *Wrow = W_f16 + static_cast<size_t>(j) * cols;
+                out[j] = dotProductFMA_F16(x, Wrow, cols);
+            }
+        }
+
+        /// @brief Fused QKV matrix-vector multiplication.
+        ///
+        /// Computes Q = x * attnQ^T, K = x * attnK^T, V = x * attnV^T in a single
+        /// pass over the input vector x. This reduces x-vector reads from 3× to 1×
+        /// per token per layer, improving cache utilization.
+        ///
+        /// All three matrices must use the same quantized type (typically Q2_K).
+        /// For F32 matrices, falls back to three separate calls.
+        static void matMulVecFusedQKV(
+                const QuantizedMatrix &qMat, const QuantizedMatrix &kMat, const QuantizedMatrix &vMat,
+                const float *x,
+                float *qOut, float *kOut, float *vOut) {
+
+            uint32_t qRows = qMat.rows;
+            uint32_t kRows = kMat.rows;
+            uint32_t vRows = vMat.rows;
+            uint32_t cols = qMat.cols;// All three share the same input dimension
+
+            // Fall back to separate calls if any matrix is F32 or types differ.
+            // The fused optimization requires all matrices to share the same quantized
+            // type (and thus the same block size and row stride). In practice, Qwen2
+            // models use Q2_K for Q/K but Q4_K for V, so the types differ.
+            if (qMat.type != kMat.type || qMat.type != vMat.type ||
+                qMat.type == GGML_TYPE_F32) {
+                qMat.matMulVec(x, qOut);
+                kMat.matMulVec(x, kOut);
+                vMat.matMulVec(x, vOut);
+                return;
+            }
+
+            uint32_t blockSize = ggmlBlockSize(qMat.type);
+            uint32_t typeSize = ggmlTypeSize(qMat.type);
+
+            if (blockSize == 0 || typeSize == 0) {
+                // Fallback for unknown types
+                qMat.matMulVec(x, qOut);
+                kMat.matMulVec(x, kOut);
+                vMat.matMulVec(x, vOut);
+                return;
+            }
+
+            uint32_t blocksPerRow = (cols + blockSize - 1) / blockSize;
+            uint64_t rowStride = static_cast<uint64_t>(blocksPerRow) * typeSize;
+
+            // Initialize outputs to zero
+            std::memset(qOut, 0, static_cast<size_t>(qRows) * sizeof(float));
+            std::memset(kOut, 0, static_cast<size_t>(kRows) * sizeof(float));
+            std::memset(vOut, 0, static_cast<size_t>(vRows) * sizeof(float));
+
+            // Cache-blocked loop: process one block column across all three matrices.
+            // This reads the x vector once instead of three times.
+            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                uint32_t start = b * blockSize;
+                uint32_t n = std::min(blockSize, cols - start);
+                const float *xBlock = x + start;
+
+                // Process this block across all Q rows
+                for (uint32_t j = 0; j < qRows; ++j) {
+                    const uint8_t *blockData = qMat.data.data() + static_cast<uint64_t>(j) * rowStride + static_cast<uint64_t>(b) * typeSize;
+                    qOut[j] += GGMLDequantize::dotProductFused(qMat.type, blockData, xBlock, n);
+                }
+
+                // Process this block across all K rows
+                for (uint32_t j = 0; j < kRows; ++j) {
+                    const uint8_t *blockData = kMat.data.data() + static_cast<uint64_t>(j) * rowStride + static_cast<uint64_t>(b) * typeSize;
+                    kOut[j] += GGMLDequantize::dotProductFused(kMat.type, blockData, xBlock, n);
+                }
+
+                // Process this block across all V rows
+                for (uint32_t j = 0; j < vRows; ++j) {
+                    const uint8_t *blockData = vMat.data.data() + static_cast<uint64_t>(j) * rowStride + static_cast<uint64_t>(b) * typeSize;
+                    vOut[j] += GGMLDequantize::dotProductFused(vMat.type, blockData, xBlock, n);
+                }
+            }
+        }
     }// namespace
+
+    // -----------------------------------------------------------------------
 
     std::vector<float> Model::debugForwardWithDumps(int32_t tokenId) {
         uint32_t hiddenSize = config_.hiddenSize;
@@ -792,74 +1378,192 @@ namespace tinycoder {
             auto &w = layers_[layer];
             std::cout << "\n--- Layer " << layer << " ---" << std::endl;
 
-            // ---- Attention block ----
+            // Check if this is an SSM layer for Qwen35MoE architecture
+            bool isSSMLayer = (config_.architecture == ARCH_QWEN35MOE &&
+                               config_.fullAttentionInterval > 0 &&
+                               (layer % config_.fullAttentionInterval) != 0 &&
+                               !w.ssmOut.empty());
 
-            // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
-            rmsNormInPlace(hidden.data(), attnNorm.data(), w.rmsNormAttn.data(), hiddenSize);
-            dumpVecStats(attnNorm.data(), hiddenSize, "  After attn_norm");
+            if (isSSMLayer) {
+                // ---- SSM (Mamba-style) block replaces attention ----
 
-            // Q projection
-            np::Array<float> qRow = w.attnQ.matMulVec(attnNorm.data());
-            std::memcpy(q.data(), qRow.data(), nHeads * headDim * sizeof(float));
-            if (!w.attnQBias.empty()) {
-                const float *qBias = w.attnQBias.data();
-                for (uint32_t i = 0; i < nHeads * headDim; ++i)
-                    q[i] += qBias[i];
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                rmsNormInPlace(hidden.data(), attnNorm.data(), w.rmsNormAttn.data(), hiddenSize);
+                dumpVecStats(attnNorm.data(), hiddenSize, "  After attn_norm (SSM)");
+
+                // SSM computation for single token
+                uint32_t ssmInnerSize = config_.ssmInnerSize;
+                uint32_t ssmStateSize = config_.ssmStateSize;
+                uint32_t ssmConvKernel = config_.ssmConvKernel;
+
+                // Step 1: Input projection (hiddenSize → ssmInnerSize)
+                np::Array<float> ssmIn = w.ssmOut.matMulVec(attnNorm.data());
+                float *ssmInData = ssmIn.data();
+
+                // Step 2: Conv1d with past buffer
+                std::vector<float> convOut(ssmInnerSize);
+                if (ssmConvKernel > 1 && !w.ssmConv1d.empty()) {
+                    std::vector<float> convInput(ssmConvKernel * ssmInnerSize);
+                    auto &convBuf = kvCache_.ssmConvBuf[layer];
+                    uint32_t bufLen = ssmConvKernel - 1;
+                    for (uint32_t i = 0; i < bufLen * ssmInnerSize; ++i) {
+                        convInput[i] = convBuf[i];
+                    }
+                    std::memcpy(convInput.data() + bufLen * ssmInnerSize,
+                                ssmInData, ssmInnerSize * sizeof(float));
+
+                    for (uint32_t i = 0; i < (bufLen - 1) * ssmInnerSize; ++i) {
+                        convBuf[i] = convBuf[i + ssmInnerSize];
+                    }
+                    std::memcpy(convBuf.data() + (bufLen - 1) * ssmInnerSize,
+                                ssmInData, ssmInnerSize * sizeof(float));
+
+                    for (uint32_t c = 0; c < ssmInnerSize; ++c) {
+                        double dot = 0.0;
+                        const float *wRow = reinterpret_cast<const float *>(w.ssmConv1d.data.data()) + static_cast<size_t>(c) * ssmConvKernel;
+                        for (uint32_t k = 0; k < ssmConvKernel; ++k) {
+                            dot += static_cast<double>(wRow[k]) * convInput[c * ssmConvKernel + k];
+                        }
+                        convOut[c] = static_cast<float>(dot);
+                    }
+                } else {
+                    std::memcpy(convOut.data(), ssmInData, ssmInnerSize * sizeof(float));
+                }
+
+                // Step 3: SiLU activation on conv output
+                for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                    convOut[i] = convOut[i] / (1.0f + std::exp(-convOut[i]));
+                }
+
+                // Step 4: SSM state update
+                auto &ssmState = kvCache_.ssmState[layer];
+                for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                    float dt = std::log(1.0f + std::exp(w.ssmDtBias.data()[i]));
+                    for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                        float aVal = w.ssmA.data()[i * ssmStateSize + j];
+                        float aBar = std::exp(aVal * dt);
+                        uint32_t idx = i * ssmStateSize + j;
+                        ssmState[idx] = aBar * ssmState[idx] + convOut[i];
+                    }
+                }
+
+                // Step 5: Output from SSM state
+                std::vector<float> ssmOutBuf(ssmInnerSize);
+                for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                    double hVal = 0.0;
+                    for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                        hVal += ssmState[i * ssmStateSize + j];
+                    }
+                    float gate = w.ssmAlpha.data()[i] * static_cast<float>(hVal) + w.ssmBeta.data()[i];
+                    float gateAct = gate / (1.0f + std::exp(-gate));
+                    ssmOutBuf[i] = convOut[i] * gateAct;
+                }
+
+                // Step 6: Output projection back to hiddenSize using attnO
+                np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOutBuf.data(),
+                                                           w.attnO.rows, w.attnO.cols);
+                std::memcpy(attnProj.data(), projRow.data(), hiddenSize * sizeof(float));
+                dumpVecStats(attnProj.data(), hiddenSize, "  After SSM proj");
+
+                // SSM residual (standard residual, no post-norm)
+                for (uint32_t i = 0; i < hiddenSize; ++i) {
+                    hidden[i] += attnProj[i];
+                }
+                dumpVecStats(hidden.data(), hiddenSize, "  After SSM + residual");
+            } else {
+                // ---- Attention block ----
+
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                rmsNormInPlace(hidden.data(), attnNorm.data(), w.rmsNormAttn.data(), hiddenSize);
+                dumpVecStats(attnNorm.data(), hiddenSize, "  After attn_norm");
+
+                // Q projection (architecture-aware bias)
+                np::Array<float> qRow = w.attnQ.matMulVec(attnNorm.data());
+                std::memcpy(q.data(), qRow.data(), nHeads * headDim * sizeof(float));
+                if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
+                    const float *qBias = w.attnQBias.data();
+                    for (uint32_t i = 0; i < nHeads * headDim; ++i)
+                        q[i] += qBias[i];
+                }
+                dumpVecStats(q.data(), nHeads * headDim, "  Q (after proj)");
+
+                // K projection (architecture-aware bias)
+                np::Array<float> kRow = w.attnK.matMulVec(attnNorm.data());
+                std::memcpy(k.data(), kRow.data(), nKVHeads * headDim * sizeof(float));
+                if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
+                    const float *kBias = w.attnKBias.data();
+                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
+                        k[i] += kBias[i];
+                }
+
+                // V projection (architecture-aware bias)
+                np::Array<float> vRow = w.attnV.matMulVec(attnNorm.data());
+                std::memcpy(v.data(), vRow.data(), nKVHeads * headDim * sizeof(float));
+                if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
+                    const float *vBias = w.attnVBias.data();
+                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
+                        v[i] += vBias[i];
+                }
+
+                // Apply Q/K norms before RoPE (Gemma4 and Qwen35MoE)
+                if (config_.architecture == ARCH_GEMMA4 && !w.attnQNorm.empty() && !w.attnKNorm.empty()) {
+                    applyQKNorms(q.data(), k.data(), 1, nHeads, nKVHeads,
+                                 w.attnQNorm.data(), w.attnKNorm.data());
+                } else if (config_.architecture == ARCH_QWEN35MOE && !w.attnQNormMoe.empty() && !w.attnKNormMoe.empty()) {
+                    applyQKNorms(q.data(), k.data(), 1, nHeads, nKVHeads,
+                                 w.attnQNormMoe.data(), w.attnKNormMoe.data());
+                }
+
+                // Apply RoPE
+                applyRoPE(q.data(), k.data(), 1, 1, nHeads, nKVHeads,
+                          static_cast<uint32_t>(kvCache_.pos));
+                dumpVecStats(q.data(), nHeads * headDim, "  Q (after RoPE)");
+
+                // Store K, V in cache
+                uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
+                float *kCacheLayer =
+                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                float *vCacheLayer =
+                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                uint32_t kvSize = nKVHeads * headDim;
+                for (uint32_t i = 0; i < kvSize; ++i) {
+                    kCacheLayer[cachePos * nKVHeads * headDim + i] = k[i];
+                    vCacheLayer[cachePos * nKVHeads * headDim + i] = v[i];
+                }
+
+                // Attention
+                uint32_t totalCacheLen = cachePos + 1;
+                attentionFused(q.data(), kCacheLayer, vCacheLayer, attnOut.data(),
+                               1, cachePos, totalCacheLen, layer);
+                dumpVecStats(attnOut.data(), nHeads * headDim, "  After attention");
+
+                // Output projection (using dequantized F32 weights for exact float dot product)
+                np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnOut.data(),
+                                                           w.attnO.rows, w.attnO.cols);
+                std::memcpy(attnProj.data(), projRow.data(), hiddenSize * sizeof(float));
+                dumpVecStats(attnProj.data(), hiddenSize, "  After attnO proj");
+
+                // Attention residual + post-attention processing (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4 && !w.postAttnNorm.empty()) {
+                    // Gemma4: post-attention norm + layer scale
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        hidden[i] += attnProj[i];
+                    }
+                    rmsNormInPlace(hidden.data(), hidden.data(), w.postAttnNorm.data(), hiddenSize);
+                    if (!w.layerOutputScale.empty()) {
+                        float scale = w.layerOutputScale.data()[0];
+                        for (uint32_t i = 0; i < hiddenSize; ++i) {
+                            hidden[i] *= scale;
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        hidden[i] += attnProj[i];
+                    }
+                }
+                dumpVecStats(hidden.data(), hiddenSize, "  After attention + residual");
             }
-            dumpVecStats(q.data(), nHeads * headDim, "  Q (after proj)");
-
-            // K projection
-            np::Array<float> kRow = w.attnK.matMulVec(attnNorm.data());
-            std::memcpy(k.data(), kRow.data(), nKVHeads * headDim * sizeof(float));
-            if (!w.attnKBias.empty()) {
-                const float *kBias = w.attnKBias.data();
-                for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                    k[i] += kBias[i];
-            }
-
-            // V projection
-            np::Array<float> vRow = w.attnV.matMulVec(attnNorm.data());
-            std::memcpy(v.data(), vRow.data(), nKVHeads * headDim * sizeof(float));
-            if (!w.attnVBias.empty()) {
-                const float *vBias = w.attnVBias.data();
-                for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                    v[i] += vBias[i];
-            }
-
-            // Apply RoPE
-            applyRoPE(q.data(), k.data(), 1, 1, nHeads, nKVHeads,
-                      static_cast<uint32_t>(kvCache_.pos));
-            dumpVecStats(q.data(), nHeads * headDim, "  Q (after RoPE)");
-
-            // Store K, V in cache
-            uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
-            float *kCacheLayer =
-                    kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
-            float *vCacheLayer =
-                    kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
-            uint32_t kvSize = nKVHeads * headDim;
-            for (uint32_t i = 0; i < kvSize; ++i) {
-                kCacheLayer[cachePos * nKVHeads * headDim + i] = k[i];
-                vCacheLayer[cachePos * nKVHeads * headDim + i] = v[i];
-            }
-
-            // Attention
-            uint32_t totalCacheLen = cachePos + 1;
-            attentionFused(q.data(), kCacheLayer, vCacheLayer, attnOut.data(),
-                           1, cachePos, totalCacheLen, layer);
-            dumpVecStats(attnOut.data(), nHeads * headDim, "  After attention");
-
-            // Output projection (using dequantized F32 weights for exact float dot product)
-            np::Array<float> projRow = deqMatMulVec(w.attnO_deq.data(), attnOut.data(),
-                                                    w.attnO.rows, w.attnO.cols);
-            std::memcpy(attnProj.data(), projRow.data(), hiddenSize * sizeof(float));
-            dumpVecStats(attnProj.data(), hiddenSize, "  After attnO proj");
-
-            // Residual: hidden += attnProj
-            for (uint32_t i = 0; i < hiddenSize; ++i) {
-                hidden[i] += attnProj[i];
-            }
-            dumpVecStats(hidden.data(), hiddenSize, "  After attention + residual");
 
             // ---- FFN block ----
 
@@ -867,29 +1571,80 @@ namespace tinycoder {
             rmsNormInPlace(hidden.data(), ffnNorm.data(), w.rmsNormFFN.data(), hiddenSize);
             dumpVecStats(ffnNorm.data(), hiddenSize, "  After ffn_norm");
 
-            // Gate projection
-            np::Array<float> gateRow = w.ffnGate.matMulVec(ffnNorm.data());
-            std::memcpy(gate.data(), gateRow.data(), intermediateSize * sizeof(float));
-            dumpVecStats(gate.data(), intermediateSize, "  Gate (before SwiGLU)");
+            // Gemma4 MoE path (expertCount > 0)
+            if (config_.architecture == ARCH_GEMMA4 && config_.expertCount > 0) {
+                computeGemma4MoE(ffnNorm.data(), ffnOut.data(), 1, hiddenSize, intermediateSize, w);
+                dumpVecStats(ffnOut.data(), hiddenSize, "  After MoE FFN");
+                // Residual + layer scale
+                for (uint32_t i = 0; i < hiddenSize; ++i) {
+                    hidden[i] += ffnOut[i];
+                }
+                if (!w.layerOutputScale.empty()) {
+                    float scale = w.layerOutputScale.data()[0];
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        hidden[i] *= scale;
+                    }
+                }
+            } else if (config_.architecture == ARCH_QWEN35MOE && config_.expertCount > 0) {
+                // Qwen35MoE MoE path
+                computeQwen35MoE(ffnNorm.data(), ffnOut.data(), 1, hiddenSize, intermediateSize, w);
+                dumpVecStats(ffnOut.data(), hiddenSize, "  After Qwen35MoE MoE FFN");
+                // Standard residual (no post-norm)
+                for (uint32_t i = 0; i < hiddenSize; ++i) {
+                    hidden[i] += ffnOut[i];
+                }
+            } else {
+                // Dense FFN path
 
-            // Up projection
-            np::Array<float> upRow = w.ffnUp.matMulVec(ffnNorm.data());
-            std::memcpy(up.data(), upRow.data(), intermediateSize * sizeof(float));
-            dumpVecStats(up.data(), intermediateSize, "  Up (before SwiGLU)");
+                // Gate projection
+                np::Array<float> gateRow = w.ffnGate.matMulVec(ffnNorm.data());
+                std::memcpy(gate.data(), gateRow.data(), intermediateSize * sizeof(float));
+                dumpVecStats(gate.data(), intermediateSize, "  Gate (before activation)");
 
-            // SwiGLU: gate = silu(gate) * up
-            swiGLUInPlace(gate.data(), up.data(), intermediateSize);
-            dumpVecStats(gate.data(), intermediateSize, "  After SwiGLU");
+                // Up projection
+                np::Array<float> upRow = w.ffnUp.matMulVec(ffnNorm.data());
+                std::memcpy(up.data(), upRow.data(), intermediateSize * sizeof(float));
+                dumpVecStats(up.data(), intermediateSize, "  Up (before activation)");
 
-            // Down projection (using dequantized F32 weights for exact float dot product)
-            np::Array<float> downRow = deqMatMulVec(w.ffnDown_deq.data(), gate.data(),
-                                                    w.ffnDown.rows, w.ffnDown.cols);
-            std::memcpy(ffnOut.data(), downRow.data(), hiddenSize * sizeof(float));
-            dumpVecStats(ffnOut.data(), hiddenSize, "  After ffnDown proj");
+                // FFN activation (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4) {
+                    // Gemma4: GeGLU activation (gelu(gate) * up)
+                    geluInPlace(gate.data(), intermediateSize);
+                    for (uint32_t i = 0; i < intermediateSize; ++i) {
+                        gate[i] *= up[i];
+                    }
+                    dumpVecStats(gate.data(), intermediateSize, "  After GeGLU");
+                } else {
+                    // Qwen2, Qwen35MoE: SwiGLU activation (silu(gate) * up)
+                    swiGLUInPlace(gate.data(), up.data(), intermediateSize);
+                    dumpVecStats(gate.data(), intermediateSize, "  After SwiGLU");
+                }
 
-            // Residual: hidden += ffnOut
-            for (uint32_t i = 0; i < hiddenSize; ++i) {
-                hidden[i] += ffnOut[i];
+                // Down projection (using dequantized F32 weights for exact float dot product)
+                np::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), gate.data(),
+                                                           w.ffnDown.rows, w.ffnDown.cols);
+                std::memcpy(ffnOut.data(), downRow.data(), hiddenSize * sizeof(float));
+                dumpVecStats(ffnOut.data(), hiddenSize, "  After ffnDown proj");
+
+                // FFN residual + post-FFN processing (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4 && !w.postFFWNorm.empty()) {
+                    // Gemma4: post-FFN norm + layer scale
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        hidden[i] += ffnOut[i];
+                    }
+                    rmsNormInPlace(hidden.data(), hidden.data(), w.postFFWNorm.data(), hiddenSize);
+                    if (!w.layerOutputScale.empty()) {
+                        float scale = w.layerOutputScale.data()[0];
+                        for (uint32_t i = 0; i < hiddenSize; ++i) {
+                            hidden[i] *= scale;
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        hidden[i] += ffnOut[i];
+                    }
+                }
             }
             dumpVecStats(hidden.data(), hiddenSize, "  After FFN + residual");
         }
@@ -921,6 +1676,11 @@ namespace tinycoder {
         } else {
             LMHead::computeCPUSeparate(hidden.data(), lmHead_.data.data(), lmHead_.type,
                                        lmHead_.rows, lmHead_.cols, logits.data());
+        }
+
+        // Apply final logit softcapping (Gemma4 architecture)
+        if (config_.architecture == ARCH_GEMMA4 && config_.finalLogitSoftcapping > 0.0f) {
+            softcapInPlace(logits.data(), vocabSize, config_.finalLogitSoftcapping);
         }
         dumpVecStats(logits.data(), vocabSize, "Final logits");
 
@@ -984,67 +1744,182 @@ namespace tinycoder {
         for (uint32_t layer = 0; layer < nLayers; ++layer) {
             auto &w = layers_[layer];
 
-            // ---- Attention block ----
+            // Check if this is an SSM layer for Qwen35MoE architecture
+            bool isSSMLayer = (config_.architecture == ARCH_QWEN35MOE &&
+                               config_.fullAttentionInterval > 0 &&
+                               (layer % config_.fullAttentionInterval) != 0 &&
+                               !w.ssmOut.empty());
 
-            // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
-            rmsNormInPlace(hidden.data(), attnNorm.data(), w.rmsNormAttn.data(), hiddenSize);
+            if (isSSMLayer) {
+                // ---- SSM (Mamba-style) block replaces attention ----
 
-            // Q projection
-            np::Array<float> qRow = w.attnQ.matMulVec(attnNorm.data());
-            std::memcpy(q.data(), qRow.data(), nHeads * headDim * sizeof(float));
-            if (!w.attnQBias.empty()) {
-                const float *qBias = w.attnQBias.data();
-                for (uint32_t i = 0; i < nHeads * headDim; ++i)
-                    q[i] += qBias[i];
-            }
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                rmsNormInPlace(hidden.data(), attnNorm.data(), w.rmsNormAttn.data(), hiddenSize);
 
-            // K projection
-            np::Array<float> kRow = w.attnK.matMulVec(attnNorm.data());
-            std::memcpy(k.data(), kRow.data(), nKVHeads * headDim * sizeof(float));
-            if (!w.attnKBias.empty()) {
-                const float *kBias = w.attnKBias.data();
-                for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                    k[i] += kBias[i];
-            }
+                // SSM computation for single token
+                uint32_t ssmInnerSize = config_.ssmInnerSize;
+                uint32_t ssmStateSize = config_.ssmStateSize;
+                uint32_t ssmConvKernel = config_.ssmConvKernel;
 
-            // V projection
-            np::Array<float> vRow = w.attnV.matMulVec(attnNorm.data());
-            std::memcpy(v.data(), vRow.data(), nKVHeads * headDim * sizeof(float));
-            if (!w.attnVBias.empty()) {
-                const float *vBias = w.attnVBias.data();
-                for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                    v[i] += vBias[i];
-            }
+                // Step 1: Input projection (hiddenSize → ssmInnerSize)
+                np::Array<float> ssmIn = w.ssmOut.matMulVec(attnNorm.data());
+                float *ssmInData = ssmIn.data();
 
-            // Apply RoPE
-            applyRoPE(q.data(), k.data(), 1, 1, nHeads, nKVHeads,
-                      static_cast<uint32_t>(kvCache_.pos));
+                // Step 2: Conv1d with past buffer
+                std::vector<float> convOut(ssmInnerSize);
+                if (ssmConvKernel > 1 && !w.ssmConv1d.empty()) {
+                    std::vector<float> convInput(ssmConvKernel * ssmInnerSize);
+                    auto &convBuf = kvCache_.ssmConvBuf[layer];
+                    uint32_t bufLen = ssmConvKernel - 1;
+                    for (uint32_t i = 0; i < bufLen * ssmInnerSize; ++i) {
+                        convInput[i] = convBuf[i];
+                    }
+                    std::memcpy(convInput.data() + bufLen * ssmInnerSize,
+                                ssmInData, ssmInnerSize * sizeof(float));
 
-            // Store K, V in cache
-            uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
-            float *kCacheLayer =
-                    kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
-            float *vCacheLayer =
-                    kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
-            uint32_t kvSize = nKVHeads * headDim;
-            for (uint32_t i = 0; i < kvSize; ++i) {
-                kCacheLayer[cachePos * nKVHeads * headDim + i] = k[i];
-                vCacheLayer[cachePos * nKVHeads * headDim + i] = v[i];
-            }
+                    for (uint32_t i = 0; i < (bufLen - 1) * ssmInnerSize; ++i) {
+                        convBuf[i] = convBuf[i + ssmInnerSize];
+                    }
+                    std::memcpy(convBuf.data() + (bufLen - 1) * ssmInnerSize,
+                                ssmInData, ssmInnerSize * sizeof(float));
 
-            // Attention
-            uint32_t totalCacheLen = cachePos + 1;
-            attentionFused(q.data(), kCacheLayer, vCacheLayer, attnOut.data(),
-                           1, cachePos, totalCacheLen, layer);
+                    for (uint32_t c = 0; c < ssmInnerSize; ++c) {
+                        double dot = 0.0;
+                        const float *wRow = reinterpret_cast<const float *>(w.ssmConv1d.data.data()) + static_cast<size_t>(c) * ssmConvKernel;
+                        for (uint32_t k = 0; k < ssmConvKernel; ++k) {
+                            dot += static_cast<double>(wRow[k]) * convInput[c * ssmConvKernel + k];
+                        }
+                        convOut[c] = static_cast<float>(dot);
+                    }
+                } else {
+                    std::memcpy(convOut.data(), ssmInData, ssmInnerSize * sizeof(float));
+                }
 
-            // Output projection (using dequantized F32 weights for exact float dot product)
-            np::Array<float> projRow = deqMatMulVec(w.attnO_deq.data(), attnOut.data(),
-                                                    w.attnO.rows, w.attnO.cols);
-            std::memcpy(attnProj.data(), projRow.data(), hiddenSize * sizeof(float));
+                // Step 3: SiLU activation on conv output
+                for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                    convOut[i] = convOut[i] / (1.0f + std::exp(-convOut[i]));
+                }
 
-            // Residual: hidden += attnProj
-            for (uint32_t i = 0; i < hiddenSize; ++i) {
-                hidden[i] += attnProj[i];
+                // Step 4: SSM state update
+                auto &ssmState = kvCache_.ssmState[layer];
+                for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                    float dt = std::log(1.0f + std::exp(w.ssmDtBias.data()[i]));
+                    for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                        float aVal = w.ssmA.data()[i * ssmStateSize + j];
+                        float aBar = std::exp(aVal * dt);
+                        uint32_t idx = i * ssmStateSize + j;
+                        ssmState[idx] = aBar * ssmState[idx] + convOut[i];
+                    }
+                }
+
+                // Step 5: Output from SSM state
+                std::vector<float> ssmOutBuf(ssmInnerSize);
+                for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                    double hVal = 0.0;
+                    for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                        hVal += ssmState[i * ssmStateSize + j];
+                    }
+                    float gate = w.ssmAlpha.data()[i] * static_cast<float>(hVal) + w.ssmBeta.data()[i];
+                    float gateAct = gate / (1.0f + std::exp(-gate));
+                    ssmOutBuf[i] = convOut[i] * gateAct;
+                }
+
+                // Step 6: Output projection back to hiddenSize using attnO
+                np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOutBuf.data(),
+                                                           w.attnO.rows, w.attnO.cols);
+                std::memcpy(attnProj.data(), projRow.data(), hiddenSize * sizeof(float));
+
+                // SSM residual (standard residual, no post-norm)
+                for (uint32_t i = 0; i < hiddenSize; ++i) {
+                    hidden[i] += attnProj[i];
+                }
+            } else {
+                // ---- Attention block ----
+
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                rmsNormInPlace(hidden.data(), attnNorm.data(), w.rmsNormAttn.data(), hiddenSize);
+
+                // Q projection (architecture-aware bias)
+                np::Array<float> qRow = w.attnQ.matMulVec(attnNorm.data());
+                std::memcpy(q.data(), qRow.data(), nHeads * headDim * sizeof(float));
+                if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
+                    const float *qBias = w.attnQBias.data();
+                    for (uint32_t i = 0; i < nHeads * headDim; ++i)
+                        q[i] += qBias[i];
+                }
+
+                // K projection (architecture-aware bias)
+                np::Array<float> kRow = w.attnK.matMulVec(attnNorm.data());
+                std::memcpy(k.data(), kRow.data(), nKVHeads * headDim * sizeof(float));
+                if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
+                    const float *kBias = w.attnKBias.data();
+                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
+                        k[i] += kBias[i];
+                }
+
+                // V projection (architecture-aware bias)
+                np::Array<float> vRow = w.attnV.matMulVec(attnNorm.data());
+                std::memcpy(v.data(), vRow.data(), nKVHeads * headDim * sizeof(float));
+                if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
+                    const float *vBias = w.attnVBias.data();
+                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
+                        v[i] += vBias[i];
+                }
+
+                // Apply Q/K norms before RoPE (Gemma4 and Qwen35MoE)
+                if (config_.architecture == ARCH_GEMMA4 && !w.attnQNorm.empty() && !w.attnKNorm.empty()) {
+                    applyQKNorms(q.data(), k.data(), 1, nHeads, nKVHeads,
+                                 w.attnQNorm.data(), w.attnKNorm.data());
+                } else if (config_.architecture == ARCH_QWEN35MOE && !w.attnQNormMoe.empty() && !w.attnKNormMoe.empty()) {
+                    applyQKNorms(q.data(), k.data(), 1, nHeads, nKVHeads,
+                                 w.attnQNormMoe.data(), w.attnKNormMoe.data());
+                }
+
+                // Apply RoPE
+                applyRoPE(q.data(), k.data(), 1, 1, nHeads, nKVHeads,
+                          static_cast<uint32_t>(kvCache_.pos));
+
+                // Store K, V in cache
+                uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
+                float *kCacheLayer =
+                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                float *vCacheLayer =
+                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                uint32_t kvSize = nKVHeads * headDim;
+                for (uint32_t i = 0; i < kvSize; ++i) {
+                    kCacheLayer[cachePos * nKVHeads * headDim + i] = k[i];
+                    vCacheLayer[cachePos * nKVHeads * headDim + i] = v[i];
+                }
+
+                // Attention
+                uint32_t totalCacheLen = cachePos + 1;
+                attentionFused(q.data(), kCacheLayer, vCacheLayer, attnOut.data(),
+                               1, cachePos, totalCacheLen, layer);
+
+                // Output projection (using dequantized F32 weights for exact float dot product)
+                np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnOut.data(),
+                                                           w.attnO.rows, w.attnO.cols);
+                std::memcpy(attnProj.data(), projRow.data(), hiddenSize * sizeof(float));
+
+                // Attention residual + post-attention processing (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4 && !w.postAttnNorm.empty()) {
+                    // Gemma4: post-attention norm + layer scale
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        hidden[i] += attnProj[i];
+                    }
+                    rmsNormInPlace(hidden.data(), hidden.data(), w.postAttnNorm.data(), hiddenSize);
+                    if (!w.layerOutputScale.empty()) {
+                        float scale = w.layerOutputScale.data()[0];
+                        for (uint32_t i = 0; i < hiddenSize; ++i) {
+                            hidden[i] *= scale;
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        hidden[i] += attnProj[i];
+                    }
+                }
             }
 
             // ---- FFN block ----
@@ -1052,25 +1927,73 @@ namespace tinycoder {
             // RMSNorm: ffnNorm = rmsNorm(hidden, w.rmsNormFFN)
             rmsNormInPlace(hidden.data(), ffnNorm.data(), w.rmsNormFFN.data(), hiddenSize);
 
-            // Gate projection
-            np::Array<float> gateRow = w.ffnGate.matMulVec(ffnNorm.data());
-            std::memcpy(gate.data(), gateRow.data(), intermediateSize * sizeof(float));
+            // Gemma4 MoE path (expertCount > 0)
+            if (config_.architecture == ARCH_GEMMA4 && config_.expertCount > 0) {
+                computeGemma4MoE(ffnNorm.data(), ffnOut.data(), 1, hiddenSize, intermediateSize, w);
+                // Residual + layer scale
+                for (uint32_t i = 0; i < hiddenSize; ++i) {
+                    hidden[i] += ffnOut[i];
+                }
+                if (!w.layerOutputScale.empty()) {
+                    float scale = w.layerOutputScale.data()[0];
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        hidden[i] *= scale;
+                    }
+                }
+            } else if (config_.architecture == ARCH_QWEN35MOE && config_.expertCount > 0) {
+                // Qwen35MoE MoE path
+                computeQwen35MoE(ffnNorm.data(), ffnOut.data(), 1, hiddenSize, intermediateSize, w);
+                // Standard residual (no post-norm)
+                for (uint32_t i = 0; i < hiddenSize; ++i) {
+                    hidden[i] += ffnOut[i];
+                }
+            } else {
+                // Dense FFN path
 
-            // Up projection
-            np::Array<float> upRow = w.ffnUp.matMulVec(ffnNorm.data());
-            std::memcpy(up.data(), upRow.data(), intermediateSize * sizeof(float));
+                // Gate projection
+                np::Array<float> gateRow = w.ffnGate.matMulVec(ffnNorm.data());
+                std::memcpy(gate.data(), gateRow.data(), intermediateSize * sizeof(float));
 
-            // SwiGLU: gate = silu(gate) * up
-            swiGLUInPlace(gate.data(), up.data(), intermediateSize);
+                // Up projection
+                np::Array<float> upRow = w.ffnUp.matMulVec(ffnNorm.data());
+                std::memcpy(up.data(), upRow.data(), intermediateSize * sizeof(float));
 
-            // Down projection (using dequantized F32 weights for exact float dot product)
-            np::Array<float> downRow = deqMatMulVec(w.ffnDown_deq.data(), gate.data(),
-                                                    w.ffnDown.rows, w.ffnDown.cols);
-            std::memcpy(ffnOut.data(), downRow.data(), hiddenSize * sizeof(float));
+                // FFN activation (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4) {
+                    // Gemma4: GeGLU activation (gelu(gate) * up)
+                    geluInPlace(gate.data(), intermediateSize);
+                    for (uint32_t i = 0; i < intermediateSize; ++i) {
+                        gate[i] *= up[i];
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: SwiGLU activation (silu(gate) * up)
+                    swiGLUInPlace(gate.data(), up.data(), intermediateSize);
+                }
 
-            // Residual: hidden += ffnOut
-            for (uint32_t i = 0; i < hiddenSize; ++i) {
-                hidden[i] += ffnOut[i];
+                // Down projection (using dequantized F32 weights for exact float dot product)
+                np::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), gate.data(),
+                                                           w.ffnDown.rows, w.ffnDown.cols);
+                std::memcpy(ffnOut.data(), downRow.data(), hiddenSize * sizeof(float));
+
+                // FFN residual + post-FFN processing (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4 && !w.postFFWNorm.empty()) {
+                    // Gemma4: post-FFN norm + layer scale
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        hidden[i] += ffnOut[i];
+                    }
+                    rmsNormInPlace(hidden.data(), hidden.data(), w.postFFWNorm.data(), hiddenSize);
+                    if (!w.layerOutputScale.empty()) {
+                        float scale = w.layerOutputScale.data()[0];
+                        for (uint32_t i = 0; i < hiddenSize; ++i) {
+                            hidden[i] *= scale;
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        hidden[i] += ffnOut[i];
+                    }
+                }
             }
         }
 
@@ -1108,6 +2031,11 @@ namespace tinycoder {
                                        lmHead_.rows, lmHead_.cols, logits.data());
         }
 
+        // Apply final logit softcapping (Gemma4 architecture)
+        if (config_.architecture == ARCH_GEMMA4 && config_.finalLogitSoftcapping > 0.0f) {
+            softcapInPlace(logits.data(), vocabSize, config_.finalLogitSoftcapping);
+        }
+
         return {std::move(finalHidden), std::move(logits)};
     }
 
@@ -1131,18 +2059,15 @@ namespace tinycoder {
 
         // Token embeddings: [seqLen, hiddenSize]
         // Dequantize from quantized format on-the-fly (parallel over tokens)
-#pragma omp parallel for schedule(static)
-        for (uint32_t i = 0; i < seqLen; ++i) {
+        ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t i) {
             int32_t tokenId = tokens[i];
             if (tokenId >= 0 &&
                 tokenId < static_cast<int32_t>(quantizedEmbeddings_.vocabSize)) {
                 auto embRow = quantizedEmbeddings_.getRow(tokenId);
                 float *hRow = hiddenData + i * hiddenSize;
-                for (uint32_t j = 0; j < hiddenSize; ++j) {
-                    hRow[j] = embRow[j];
-                }
+                std::memcpy(hRow, embRow.data(), hiddenSize * sizeof(float));
             }
-        }
+        });
 
         // Pre-allocate per-layer buffers (reused across layers)
         // attnNorm: [seqLen, hiddenSize]
@@ -1173,359 +2098,319 @@ namespace tinycoder {
         float *gateData = gate.data();
         float *upData = up.data();
         np::Array<float> ffnOut = np::Array<float>(np::Shape{seqLen, hiddenSize});
-        float *ffnOutData = ffnOut.data();
-
-        // Debug: print initial hidden state stats for the last token
-        if (seqLen > 1) {
-            float hMin = hiddenData[(seqLen - 1) * hiddenSize], hMax = hiddenData[(seqLen - 1) * hiddenSize];
-            float hSumSq = 0.0f;
-            for (uint32_t i = 0; i < hiddenSize; ++i) {
-                float v = hiddenData[(seqLen - 1) * hiddenSize + i];
-                hMin = std::min(hMin, v);
-                hMax = std::max(hMax, v);
-                hSumSq += v * v;
-            }
-            float hNorm = std::sqrt(hSumSq / hiddenSize);
-            std::cout << "[DEBUG] Layer init: last token hidden min=" << hMin << " max=" << hMax << " rms=" << hNorm << std::endl;
-        }
 
         // Process through all transformer layers
         for (uint32_t layer = 0; layer < nLayers; ++layer) {
             auto &w = layers_[layer];
 
-            // ---- Attention block ----
+            // Check if this is an SSM layer for Qwen35MoE architecture
+            bool isSSMLayer = (config_.architecture == ARCH_QWEN35MOE &&
+                               config_.fullAttentionInterval > 0 &&
+                               (layer % config_.fullAttentionInterval) != 0 &&
+                               !w.ssmOut.empty());
 
-            // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
-            // Each token's RMSNorm is independent.
-            const float *rmsNormAttnData = w.rmsNormAttn.data();
-#pragma omp parallel for schedule(static)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                rmsNormInPlace(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
-                               rmsNormAttnData, hiddenSize);
-            }
+            if (isSSMLayer) {
+                // ---- SSM (Mamba-style) block replaces attention ----
 
-            // Debug: print attnNorm stats for layer 0
-            if (layer == 0 && seqLen > 1) {
-                float nMin = attnNormData[(seqLen - 1) * hiddenSize], nMax = attnNormData[(seqLen - 1) * hiddenSize];
-                float nSumSq = 0.0f;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = attnNormData[(seqLen - 1) * hiddenSize + i];
-                    nMin = std::min(nMin, v);
-                    nMax = std::max(nMax, v);
-                    nSumSq += v * v;
-                }
-                float nNorm = std::sqrt(nSumSq / hiddenSize);
-                std::cout << "[DEBUG] Layer 0 attnNorm: last token min=" << nMin << " max=" << nMax << " rms=" << nNorm << std::endl;
-                // Also print first 8 values for comparison with test
-                std::cout << "[DEBUG] Layer 0 attnNorm first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << attnNormData[(seqLen - 1) * hiddenSize + i] << " ";
-                std::cout << std::endl;
-                // Print hidden state first 8 for the last token
-                std::cout << "[DEBUG] Layer 0 hidden (last token) first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << hiddenData[(seqLen - 1) * hiddenSize + i] << " ";
-                std::cout << std::endl;
-            }
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                const float *rmsNormAttnData = w.rmsNormAttn.data();
+                ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t s) {
+                    rmsNormSIMD(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
+                                rmsNormAttnData, hiddenSize);
+                });
 
-            // Project to Q, K, V using quantized matrix-vector multiplication.
-            // Each token's Q/K/V is computed independently — parallelize over tokens.
-#pragma omp parallel for schedule(static)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *hRowPtr = attnNormData + s * hiddenSize;
+                // SSM computation for each token
+                uint32_t ssmInnerSize = config_.ssmInnerSize;
+                uint32_t ssmStateSize = config_.ssmStateSize;
+                uint32_t ssmConvKernel = config_.ssmConvKernel;
 
-                // Q projection
-                np::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
-                float *qRowPtr = qData + s * nHeads * headDim;
-                std::memcpy(qRowPtr, qRow.data(), nHeads * headDim * sizeof(float));
-                if (!w.attnQBias.empty()) {
-                    const float *qBias = w.attnQBias.data();
-                    for (uint32_t i = 0; i < nHeads * headDim; ++i)
-                        qRowPtr[i] += qBias[i];
-                }
+                // Pre-allocate SSM input buffer (reused across tokens)
+                std::vector<float> ssmInBuf(ssmInnerSize);
 
-                // K projection
-                np::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
-                float *kRowPtr = kData + s * nKVHeads * headDim;
-                std::memcpy(kRowPtr, kRow.data(), nKVHeads * headDim * sizeof(float));
-                if (!w.attnKBias.empty()) {
-                    const float *kBias = w.attnKBias.data();
-                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                        kRowPtr[i] += kBias[i];
-                }
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *hRowPtr = attnNormData + s * hiddenSize;
 
-                // V projection
-                np::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
-                float *vRowPtr = vData + s * nKVHeads * headDim;
-                std::memcpy(vRowPtr, vRow.data(), nKVHeads * headDim * sizeof(float));
-                if (!w.attnVBias.empty()) {
-                    const float *vBias = w.attnVBias.data();
-                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                        vRowPtr[i] += vBias[i];
-                }
-            }
+                    // Step 1: Input projection (hiddenSize → ssmInnerSize)
+                    // Write directly to pre-allocated buffer, avoiding heap allocation + memcpy
+                    w.ssmOut.matMulVec(hRowPtr, ssmInBuf.data());
 
-            // Debug: print Q, K, V stats for layer 0
-            if (layer == 0 && seqLen > 1) {
-                auto printVecStats = [&](const float *data, uint32_t n, const std::string &label) {
-                    float mn = data[0], mx = data[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        float v = data[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+                    // Step 2: Conv1d with past buffer
+                    std::vector<float> convOut(ssmInnerSize);
+                    if (ssmConvKernel > 1 && !w.ssmConv1d.empty()) {
+                        std::vector<float> convInput(ssmConvKernel * ssmInnerSize);
+                        auto &convBuf = kvCache_.ssmConvBuf[layer];
+                        uint32_t bufLen = ssmConvKernel - 1;
+                        std::memcpy(convInput.data(), convBuf.data(), bufLen * ssmInnerSize * sizeof(float));
+                        std::memcpy(convInput.data() + bufLen * ssmInnerSize,
+                                    ssmInBuf.data(), ssmInnerSize * sizeof(float));
+
+                        // Update conv buffer with current input (shift)
+                        std::memmove(convBuf.data(), convBuf.data() + ssmInnerSize,
+                                     (bufLen - 1) * ssmInnerSize * sizeof(float));
+                        std::memcpy(convBuf.data() + (bufLen - 1) * ssmInnerSize,
+                                    ssmInBuf.data(), ssmInnerSize * sizeof(float));
+
+                        for (uint32_t c = 0; c < ssmInnerSize; ++c) {
+                            const float *wRow = reinterpret_cast<const float *>(w.ssmConv1d.data.data()) + static_cast<size_t>(c) * ssmConvKernel;
+                            convOut[c] = dotProductFMA(wRow, convInput.data() + c * ssmConvKernel, ssmConvKernel);
+                        }
+                    } else {
+                        std::memcpy(convOut.data(), ssmInBuf.data(), ssmInnerSize * sizeof(float));
                     }
-                    float r = std::sqrt((float) (ssq / n));
-                    std::cout << "[DEBUG] Layer 0 " << label << ": last token min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                };
-                printVecStats(qData + (seqLen - 1) * nHeads * headDim, nHeads * headDim, "Q (before RoPE)");
-                printVecStats(kData + (seqLen - 1) * nKVHeads * headDim, nKVHeads * headDim, "K (before RoPE)");
-                printVecStats(vData + (seqLen - 1) * nKVHeads * headDim, nKVHeads * headDim, "V");
-            }
 
-            // Apply RoPE
-            applyRoPE(qData, kData, seqLen, seqLen, nHeads, nKVHeads,
-                      static_cast<uint32_t>(kvCache_.pos));
+                    // Step 3: SiLU activation on conv output
+                    siluSIMD(convOut.data(), ssmInnerSize);
 
-            // Debug: print Q, K stats after RoPE for layer 0
-            if (layer == 0 && seqLen > 1) {
-                auto printVecStats = [&](const float *data, uint32_t n, const std::string &label) {
-                    float mn = data[0], mx = data[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        float v = data[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+                    // Step 4: SSM state update
+                    auto &ssmState = kvCache_.ssmState[layer];
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        float dt = std::log(1.0f + std::exp(w.ssmDtBias.data()[i]));
+                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                            float aVal = w.ssmA.data()[i * ssmStateSize + j];
+                            float aBar = std::exp(aVal * dt);
+                            uint32_t idx = i * ssmStateSize + j;
+                            ssmState[idx] = aBar * ssmState[idx] + convOut[i];
+                        }
                     }
-                    float r = std::sqrt((float) (ssq / n));
-                    std::cout << "[DEBUG] Layer 0 " << label << ": last token min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                };
-                printVecStats(qData + (seqLen - 1) * nHeads * headDim, nHeads * headDim, "Q (after RoPE)");
-                printVecStats(kData + (seqLen - 1) * nKVHeads * headDim, nKVHeads * headDim, "K (after RoPE)");
-            }
 
-            // Store K, V in cache (direct pointer access, no intermediate copies)
-            uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
-            float *kCacheLayer =
-                    kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
-            float *vCacheLayer =
-                    kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                    // Step 5: Output from SSM state
+                    std::vector<float> ssmOutBuf(ssmInnerSize);
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        double hVal = 0.0;
+                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                            hVal += ssmState[i * ssmStateSize + j];
+                        }
+                        float gateVal = w.ssmAlpha.data()[i] * static_cast<float>(hVal) + w.ssmBeta.data()[i];
+                        float gateAct = gateVal / (1.0f + std::exp(-gateVal));
+                        ssmOutBuf[i] = convOut[i] * gateAct;
+                    }
 
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *kSrc = kData + s * nKVHeads * headDim;
-                const float *vSrc = vData + s * nKVHeads * headDim;
-                float *kDst = kCacheLayer + (cachePos + s) * nKVHeads * headDim;
-                float *vDst = vCacheLayer + (cachePos + s) * nKVHeads * headDim;
-                uint32_t kvSize = nKVHeads * headDim;
-                for (uint32_t i = 0; i < kvSize; ++i) {
-                    kDst[i] = kSrc[i];
-                    vDst[i] = vSrc[i];
+                    // Step 6: Output projection back to hiddenSize using attnO
+                    // Write directly to pre-allocated attnProjData buffer
+                    deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOutBuf.data(),
+                                    w.attnO.rows, w.attnO.cols,
+                                    attnProjData + s * hiddenSize);
                 }
-            }
 
-            // Attention with cached K, V (read directly from cache, no intermediate
-            // copy)
-            uint32_t totalCacheLen = cachePos + seqLen;
-            attentionFused(qData, kCacheLayer, vCacheLayer, attnOutData, seqLen,
-                           cachePos, totalCacheLen, layer);
-
-            // Debug: print attention output stats for layer 0
-            if (layer == 0 && seqLen > 1) {
-                float aMin = attnOutData[(seqLen - 1) * nHeads * headDim], aMax = attnOutData[(seqLen - 1) * nHeads * headDim];
-                float aSumSq = 0.0f;
-                for (uint32_t i = 0; i < nHeads * headDim; ++i) {
-                    float v = attnOutData[(seqLen - 1) * nHeads * headDim + i];
-                    aMin = std::min(aMin, v);
-                    aMax = std::max(aMax, v);
-                    aSumSq += v * v;
+                // SSM residual (standard residual, no post-norm)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    addSIMD(hiddenData + s * hiddenSize, attnProjData + s * hiddenSize, hiddenSize);
                 }
-                float aNorm = std::sqrt(aSumSq / (nHeads * headDim));
-                std::cout << "[DEBUG] Layer 0 attnOut: last token min=" << aMin << " max=" << aMax << " rms=" << aNorm << std::endl;
-            }
+            } else {
+                // ---- Attention block ----
 
-            // Output projection using quantized weights
-            // attnOut: [seqLen, nHeads * headDim]
-            // Output projection (using dequantized F32 weights for exact float dot product)
-            // Each token's output projection is independent.
-#pragma omp parallel for schedule(static)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *attnRowPtr = attnOutData + s * nHeads * headDim;
-                np::Array<float> projRow = deqMatMulVec(w.attnO_deq.data(), attnRowPtr,
-                                                        w.attnO.rows, w.attnO.cols);
-                float *projPtr = attnProjData + s * hiddenSize;
-                std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
-            }
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                const float *rmsNormAttnData = w.rmsNormAttn.data();
+                ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t s) {
+                    rmsNormSIMD(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
+                                rmsNormAttnData, hiddenSize);
+                });
 
-            // Residual connection: hidden += attnProj
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                float *hPtr = hiddenData + s * hiddenSize;
-                const float *aPtr = attnProjData + s * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hPtr[i] += aPtr[i];
+                // Project to Q, K, V using fused quantized matrix-vector multiplication.
+                // Fused QKV processes all three projections in a single pass over the
+                // input vector x, reducing x-vector reads from 3× to 1× per token.
+                if (config_.architecture == ARCH_QWEN2) {
+                    // Qwen2: separate Q/K/V with biases
+                    ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t s) {
+                        const float *hRowPtr = attnNormData + s * hiddenSize;
+                        float *qRowPtr = qData + s * nHeads * headDim;
+                        float *kRowPtr = kData + s * nKVHeads * headDim;
+                        float *vRowPtr = vData + s * nKVHeads * headDim;
+
+                        // Fused QKV: single pass over x for all three projections
+                        matMulVecFusedQKV(w.attnQ, w.attnK, w.attnV, hRowPtr,
+                                          qRowPtr, kRowPtr, vRowPtr);
+
+                        if (!w.attnQBias.empty()) {
+                            addSIMD(qRowPtr, w.attnQBias.data(), nHeads * headDim);
+                        }
+                        if (!w.attnKBias.empty()) {
+                            addSIMD(kRowPtr, w.attnKBias.data(), nKVHeads * headDim);
+                        }
+                        if (!w.attnVBias.empty()) {
+                            addSIMD(vRowPtr, w.attnVBias.data(), nKVHeads * headDim);
+                        }
+                    });
+                } else {
+                    // Gemma4, Qwen35MoE: no Q/K/V biases
+                    ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t s) {
+                        const float *hRowPtr = attnNormData + s * hiddenSize;
+                        float *qRowPtr = qData + s * nHeads * headDim;
+                        float *kRowPtr = kData + s * nKVHeads * headDim;
+                        float *vRowPtr = vData + s * nKVHeads * headDim;
+
+                        // Fused QKV: single pass over x for all three projections
+                        matMulVecFusedQKV(w.attnQ, w.attnK, w.attnV, hRowPtr,
+                                          qRowPtr, kRowPtr, vRowPtr);
+                    });
                 }
-            }
 
-            // Debug: print attention projection stats for the last token
-            if (seqLen > 1) {
-                float aMin = attnProjData[(seqLen - 1) * hiddenSize], aMax = attnProjData[(seqLen - 1) * hiddenSize];
-                float aSumSq = 0.0f;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = attnProjData[(seqLen - 1) * hiddenSize + i];
-                    aMin = std::min(aMin, v);
-                    aMax = std::max(aMax, v);
-                    aSumSq += v * v;
+                // Apply Q/K norms before RoPE (Gemma4 and Qwen35MoE)
+                if (config_.architecture == ARCH_GEMMA4) {
+                    if (!w.attnQNorm.empty() && !w.attnKNorm.empty()) {
+                        applyQKNorms(qData, kData, seqLen, nHeads, nKVHeads,
+                                     w.attnQNorm.data(), w.attnKNorm.data());
+                    }
+                } else if (config_.architecture == ARCH_QWEN35MOE) {
+                    if (!w.attnQNormMoe.empty() && !w.attnKNormMoe.empty()) {
+                        applyQKNorms(qData, kData, seqLen, nHeads, nKVHeads,
+                                     w.attnQNormMoe.data(), w.attnKNormMoe.data());
+                    }
                 }
-                float aNorm = std::sqrt(aSumSq / hiddenSize);
-                std::cout << "[DEBUG] Layer " << layer << " attnProj: last token min=" << aMin << " max=" << aMax << " rms=" << aNorm << std::endl;
+
+                // Apply RoPE
+                applyRoPE(qData, kData, seqLen, seqLen, nHeads, nKVHeads,
+                          static_cast<uint32_t>(kvCache_.pos));
+
+                // Store K, V in cache
+                uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
+                float *kCacheLayer =
+                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                float *vCacheLayer =
+                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *kSrc = kData + s * nKVHeads * headDim;
+                    const float *vSrc = vData + s * nKVHeads * headDim;
+                    float *kDst = kCacheLayer + (cachePos + s) * nKVHeads * headDim;
+                    float *vDst = vCacheLayer + (cachePos + s) * nKVHeads * headDim;
+                    uint32_t kvSize = nKVHeads * headDim;
+                    std::memcpy(kDst, kSrc, kvSize * sizeof(float));
+                    std::memcpy(vDst, vSrc, kvSize * sizeof(float));
+                }
+
+                // Attention with cached K, V
+                uint32_t totalCacheLen = cachePos + seqLen;
+                attentionFused(qData, kCacheLayer, vCacheLayer, attnOutData, seqLen,
+                               cachePos, totalCacheLen, layer);
+
+                // Output projection using dequantized F32 weights
+                // Write directly to pre-allocated attnProjData buffer
+                ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t s) {
+                    const float *attnRowPtr = attnOutData + s * nHeads * headDim;
+                    deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
+                                    w.attnO.rows, w.attnO.cols,
+                                    attnProjData + s * hiddenSize);
+                });
+
+                // Attention residual + post-attention processing
+                if (config_.architecture == ARCH_GEMMA4 && !w.postAttnNorm.empty()) {
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *hPtr = hiddenData + s * hiddenSize;
+                        const float *aPtr = attnProjData + s * hiddenSize;
+                        addSIMD(hPtr, aPtr, hiddenSize);
+                        rmsNormSIMD(hPtr, hPtr, w.postAttnNorm.data(), hiddenSize);
+                        if (!w.layerOutputScale.empty()) {
+                            scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
+                        }
+                    }
+                } else {
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        addSIMD(hiddenData + s * hiddenSize, attnProjData + s * hiddenSize, hiddenSize);
+                    }
+                }
             }
 
             // ---- FFN block ----
 
             // RMSNorm: ffnNorm = rmsNorm(hidden, w.rmsNormFFN)
-            // Each token's FFN norm is independent.
             const float *rmsNormFFNData = w.rmsNormFFN.data();
-#pragma omp parallel for schedule(static)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                rmsNormInPlace(hiddenData + s * hiddenSize, ffnNormData + s * hiddenSize,
-                               rmsNormFFNData, hiddenSize);
-            }
+            ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t s) {
+                rmsNormSIMD(hiddenData + s * hiddenSize, ffnNormData + s * hiddenSize,
+                            rmsNormFFNData, hiddenSize);
+            });
 
-            // Debug: print ffnNorm stats for layer 0
-            if (layer == 0 && seqLen > 1) {
-                float nMin = ffnNormData[(seqLen - 1) * hiddenSize], nMax = ffnNormData[(seqLen - 1) * hiddenSize];
-                float nSumSq = 0.0f;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = ffnNormData[(seqLen - 1) * hiddenSize + i];
-                    nMin = std::min(nMin, v);
-                    nMax = std::max(nMax, v);
-                    nSumSq += v * v;
-                }
-                float nNorm = std::sqrt(nSumSq / hiddenSize);
-                std::cout << "[DEBUG] Layer 0 ffnNorm: last token min=" << nMin << " max=" << nMax << " rms=" << nNorm << std::endl;
-            }
-
-            // SwiGLU FFN using quantized weights
-            // Fuse gate+up projections: each token's FFN is independent.
-#pragma omp parallel for schedule(static)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *ffnRowPtr = ffnNormData + s * hiddenSize;
-
-                // Gate projection
-                np::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
-                float *gatePtr = gateData + s * intermediateSize;
-                std::memcpy(gatePtr, gateRow.data(), intermediateSize * sizeof(float));
-
-                // Up projection
-                np::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
-                float *upPtr = upData + s * intermediateSize;
-                std::memcpy(upPtr, upRow.data(), intermediateSize * sizeof(float));
-
-                // SwiGLU activation in-place (fuse into projection loop)
-                for (uint32_t i = 0; i < intermediateSize; ++i) {
-                    gatePtr[i] = gatePtr[i] / (1.0f + std::exp(-gatePtr[i])) * upPtr[i];
-                }
-            }
-
-            // Debug: print gate and up stats for layer 0
-            if (layer == 0 && seqLen > 1) {
-                auto printVecStats = [&](const float *data, uint32_t n, const std::string &label) {
-                    float mn = data[0], mx = data[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        float v = data[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+            // MoE path (expertCount > 0)
+            if (config_.architecture == ARCH_GEMMA4 && config_.expertCount > 0) {
+                computeGemma4MoE(ffnNormData, ffnOut.data(), seqLen, hiddenSize, intermediateSize, w);
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    float *hPtr = hiddenData + s * hiddenSize;
+                    const float *fPtr = ffnOut.data() + s * hiddenSize;
+                    addSIMD(hPtr, fPtr, hiddenSize);
+                    if (!w.layerOutputScale.empty()) {
+                        scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
                     }
-                    float r = std::sqrt((float) (ssq / n));
-                    std::cout << "[DEBUG] Layer 0 " << label << ": last token min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                };
-                printVecStats(gateData + (seqLen - 1) * intermediateSize, intermediateSize, "ffnGate+swiglu (merged)");
-            }
-
-            // Down projection (using dequantized F32 weights for exact float dot product)
-            // Fuse with residual: hidden += ffnDown directly, avoiding extra copy
-            // Each token's down projection is independent.
-#pragma omp parallel for schedule(static)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *ffnActPtr = gateData + s * intermediateSize;
-                np::Array<float> downRow = deqMatMulVec(w.ffnDown_deq.data(), ffnActPtr,
-                                                        w.ffnDown.rows, w.ffnDown.cols);
-                float *hPtr = hiddenData + s * hiddenSize;
-                const float *downData = downRow.data();
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hPtr[i] += downData[i];
                 }
-            }
-
-            // Debug: print FFN output stats for the last token
-            if (seqLen > 1) {
-                float fMin = ffnOutData[(seqLen - 1) * hiddenSize], fMax = ffnOutData[(seqLen - 1) * hiddenSize];
-                float fSumSq = 0.0f;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = ffnOutData[(seqLen - 1) * hiddenSize + i];
-                    fMin = std::min(fMin, v);
-                    fMax = std::max(fMax, v);
-                    fSumSq += v * v;
+            } else if (config_.architecture == ARCH_QWEN35MOE && config_.expertCount > 0) {
+                computeQwen35MoE(ffnNormData, ffnOut.data(), seqLen, hiddenSize, intermediateSize, w);
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    addSIMD(hiddenData + s * hiddenSize, ffnOut.data() + s * hiddenSize, hiddenSize);
                 }
-                float fNorm = std::sqrt(fSumSq / hiddenSize);
-                std::cout << "[DEBUG] Layer " << layer << " ffnOut: last token min=" << fMin << " max=" << fMax << " rms=" << fNorm << std::endl;
-            }
+            } else {
+                // Dense FFN path
+                if (config_.architecture == ARCH_GEMMA4) {
+                    // Gemma4: GeGLU activation (gelu(gate) * up)
+                    ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t s) {
+                        const float *ffnRowPtr = ffnNormData + s * hiddenSize;
+                        float *gatePtr = gateData + s * intermediateSize;
+                        float *upPtr = upData + s * intermediateSize;
 
-            // Residual connection: hidden += ffnOut
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                float *hPtr = hiddenData + s * hiddenSize;
-                const float *fPtr = ffnOutData + s * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hPtr[i] += fPtr[i];
-                }
-            }
+                        // Write directly to pre-allocated gate/up buffers
+                        w.ffnGate.matMulVec(ffnRowPtr, gatePtr);
+                        w.ffnUp.matMulVec(ffnRowPtr, upPtr);
 
-            // Debug: print hidden state stats for the last token after each layer
-            if (seqLen > 1) {
-                float hMin = hiddenData[(seqLen - 1) * hiddenSize], hMax = hiddenData[(seqLen - 1) * hiddenSize];
-                float hSumSq = 0.0f;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = hiddenData[(seqLen - 1) * hiddenSize + i];
-                    hMin = std::min(hMin, v);
-                    hMax = std::max(hMax, v);
-                    hSumSq += v * v;
+                        // GeGLU: gelu(gate) * up
+                        geluInPlace(gatePtr, intermediateSize);
+                        for (uint32_t i = 0; i < intermediateSize; ++i) {
+                            gatePtr[i] *= upPtr[i];
+                        }
+                    });
+                } else {
+                    // Qwen2, Qwen35MoE: SwiGLU activation (silu(gate) * up)
+                    ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t s) {
+                        const float *ffnRowPtr = ffnNormData + s * hiddenSize;
+                        float *gatePtr = gateData + s * intermediateSize;
+                        float *upPtr = upData + s * intermediateSize;
+
+                        // Write directly to pre-allocated gate/up buffers
+                        w.ffnGate.matMulVec(ffnRowPtr, gatePtr);
+                        w.ffnUp.matMulVec(ffnRowPtr, upPtr);
+
+                        // SwiGLU: silu(gate) * up
+                        swiGLUSIMD(gatePtr, upPtr, intermediateSize);
+                    });
                 }
-                float hNorm = std::sqrt(hSumSq / hiddenSize);
-                std::cout << "[DEBUG] Layer " << layer << " after FFN: last token min=" << hMin << " max=" << hMax << " rms=" << hNorm << std::endl;
+
+                // Down projection fused with residual
+                // Use ffnOut as temp buffer for the down projection result,
+                // then add to hidden (residual connection)
+                ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t s) {
+                    const float *ffnActPtr = gateData + s * intermediateSize;
+                    float *downBuf = ffnOut.data() + s * hiddenSize;
+                    float *hPtr = hiddenData + s * hiddenSize;
+                    deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
+                                    w.ffnDown.rows, w.ffnDown.cols,
+                                    downBuf);
+                    addSIMD(hPtr, downBuf, hiddenSize);
+                });
+
+                // FFN residual + post-FFN processing
+                if (config_.architecture == ARCH_GEMMA4 && !w.postFFWNorm.empty()) {
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *hPtr = hiddenData + s * hiddenSize;
+                        rmsNormSIMD(hPtr, hPtr, w.postFFWNorm.data(), hiddenSize);
+                        if (!w.layerOutputScale.empty()) {
+                            scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
+                        }
+                    }
+                }
             }
         }
 
         // Final RMSNorm (parallel over tokens)
         const float *finalNormData = finalNorm_.data();
-#pragma omp parallel for schedule(static)
-        for (uint32_t s = 0; s < seqLen; ++s) {
-            rmsNormInPlace(hiddenData + s * hiddenSize, hiddenData + s * hiddenSize,
-                           finalNormData, hiddenSize);
-        }
+        ThreadPool::instance().parallelFor(0, seqLen, [&](uint32_t s) {
+            rmsNormSIMD(hiddenData + s * hiddenSize, hiddenData + s * hiddenSize,
+                        finalNormData, hiddenSize);
+        });
 
         // LM head (logits)
         np::Array<float> logits = np::Array<float>(np::Shape{seqLen, vocabSize});
         float *logitsData = logits.data();
 
         if (lmHeadTied_) {
-            // Use token embeddings as LM head (weight tying)
-            // Compute logits[s][i] = dot(hidden[s], embedding[i]) for all i
-            // This is equivalent to: logits = hidden * embeddings^T
-            // where embeddings is (vocabSize x hiddenSize) quantized matrix.
-            //
-            // For large vocabularies (151k+), this is the most expensive operation.
-            // We use optimized paths:
-            //   CUDA: cublasSgemv with persistent GPU embedding matrix
-            //   CPU:  OpenMP parallelization over the vocabulary loop
 #ifdef USE_CUDA
-            // CUDA path: dequantize the full embedding matrix once, upload to GPU,
-            // and use cublasSgemv for each token position.
-            //
-            // The embedding matrix is kept persistently on GPU so subsequent
-            // forward passes don't need to re-upload it.
+            // CUDA path (unchanged)
             static bool embedUploaded = false;
             static const float *d_embeddings = nullptr;
             static uint32_t cachedVocabSize = 0;
@@ -1533,14 +2418,12 @@ namespace tinycoder {
 
             if (!embedUploaded || cachedVocabSize != quantizedEmbeddings_.vocabSize ||
                 cachedHiddenSize != quantizedEmbeddings_.hiddenSize) {
-                // Dequantize the full embedding matrix on CPU
                 uint64_t embedElements =
                         static_cast<uint64_t>(quantizedEmbeddings_.vocabSize) *
                         quantizedEmbeddings_.hiddenSize;
                 auto embedDeq = GGMLDequantize::dequantize(
                         quantizedEmbeddings_.type, quantizedEmbeddings_.data.data(),
                         embedElements);
-
                 if (!embedDeq.empty()) {
                     try {
                         d_embeddings = cuda::uploadEmbeddings(embedDeq.data(), embedElements);
@@ -1548,16 +2431,13 @@ namespace tinycoder {
                         cachedHiddenSize = quantizedEmbeddings_.hiddenSize;
                         embedUploaded = true;
                     } catch (const std::exception &e) {
-                        std::fprintf(stderr,
-                                     "CUDA upload failed for LM head embeddings: %s\n",
-                                     e.what());
+                        std::fprintf(stderr, "CUDA upload failed: %s\n", e.what());
                         embedUploaded = false;
                     }
                 }
             }
 
             if (embedUploaded) {
-                // Use cublasSgemv for each token position
                 for (uint32_t s = 0; s < seqLen; ++s) {
                     const float *hPtr = hiddenData + s * hiddenSize;
                     float *logitRow = logitsData + s * vocabSize;
@@ -1565,19 +2445,13 @@ namespace tinycoder {
                         cuda::computeLMHead(d_embeddings, cachedHiddenSize, cachedVocabSize,
                                             hPtr, logitRow);
                     } catch (const std::exception &e) {
-                        std::fprintf(
-                                stderr,
-                                "CUDA cublasSgemv failed for LM head, falling back to CPU: %s\n",
-                                e.what());
-                        // Fallback to CPU with quantized computation
+                        std::fprintf(stderr, "CUDA LM head failed: %s\n", e.what());
                         if (!dequantizedEmbeddings_.empty()) {
-                            LMHead::computeCPU(hPtr,
-                                               dequantizedEmbeddings_.data.data(),
+                            LMHead::computeCPU(hPtr, dequantizedEmbeddings_.data.data(),
                                                dequantizedEmbeddings_.vocabSize,
                                                dequantizedEmbeddings_.hiddenSize, logitRow);
                         } else {
-                            LMHead::computeCPUQuantized(hPtr,
-                                                        quantizedEmbeddings_.data.data(),
+                            LMHead::computeCPUQuantized(hPtr, quantizedEmbeddings_.data.data(),
                                                         quantizedEmbeddings_.type,
                                                         quantizedEmbeddings_.vocabSize,
                                                         quantizedEmbeddings_.hiddenSize, logitRow);
@@ -1585,51 +2459,100 @@ namespace tinycoder {
                     }
                 }
             } else {
-                // Fallback to CPU with OpenMP parallelization
-                for (uint32_t s = 0; s < seqLen; ++s) {
+                // Consolidated single parallelFor over all (token, vocab) pairs
+                ThreadPool::instance().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
+                    uint32_t s = flatIdx / vocabSize;
+                    uint32_t i = flatIdx % vocabSize;
                     const float *hPtr = hiddenData + s * hiddenSize;
                     float *logitRow = logitsData + s * vocabSize;
+                    float dot = 0.0f;
                     if (!dequantizedEmbeddings_.empty()) {
-                        LMHead::computeCPU(hPtr,
-                                           dequantizedEmbeddings_.data.data(),
-                                           dequantizedEmbeddings_.vocabSize,
-                                           dequantizedEmbeddings_.hiddenSize, logitRow);
+                        const float *embRow = dequantizedEmbeddings_.data.data() + static_cast<uint64_t>(i) * hiddenSize;
+                        dot = dotProductFMA(hPtr, embRow, hiddenSize);
                     } else {
-                        LMHead::computeCPUQuantized(hPtr,
-                                                    quantizedEmbeddings_.data.data(),
-                                                    quantizedEmbeddings_.type,
-                                                    quantizedEmbeddings_.vocabSize,
-                                                    quantizedEmbeddings_.hiddenSize, logitRow);
+                        uint32_t blockSize = ggmlBlockSize(quantizedEmbeddings_.type);
+                        uint32_t typeSize = ggmlTypeSize(quantizedEmbeddings_.type);
+                        uint32_t numBlocks = (hiddenSize + blockSize - 1) / blockSize;
+                        for (uint32_t b = 0; b < numBlocks; ++b) {
+                            uint64_t blockOffset = static_cast<uint64_t>(i) * numBlocks + b;
+                            const uint8_t *blockData = quantizedEmbeddings_.data.data() + blockOffset * typeSize;
+                            float blockOut[256];
+                            GGMLDequantize::dequantizeBlock(quantizedEmbeddings_.type, blockData, blockOut, blockSize);
+                            uint32_t start = b * blockSize;
+                            uint32_t n = std::min(blockSize, hiddenSize - start);
+                            dot += dotProductFMA(hPtr + start, blockOut, n);
+                        }
                     }
-                }
+                    logitRow[i] = dot;
+                });
             }
 #else
-            // CPU path with OpenMP parallelization over the vocabulary loop.
-            // Uses pre-dequantized embeddings for speed.
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *hPtr = hiddenData + s * hiddenSize;
-                float *logitRow = logitsData + s * vocabSize;
-                if (!dequantizedEmbeddings_.empty()) {
-                    LMHead::computeCPU(hPtr,
-                                       dequantizedEmbeddings_.data.data(),
-                                       dequantizedEmbeddings_.vocabSize,
-                                       dequantizedEmbeddings_.hiddenSize, logitRow);
-                } else {
-                    LMHead::computeCPUQuantized(hPtr,
-                                                quantizedEmbeddings_.data.data(),
-                                                quantizedEmbeddings_.type,
-                                                quantizedEmbeddings_.vocabSize,
-                                                quantizedEmbeddings_.hiddenSize, logitRow);
-                }
+            // CPU path with pre-dequantized embeddings: consolidated single parallelFor
+            if (!dequantizedEmbeddings_.empty()) {
+                ThreadPool::instance().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
+                    uint32_t s = flatIdx / vocabSize;
+                    uint32_t i = flatIdx % vocabSize;
+                    const float *hPtr = hiddenData + s * hiddenSize;
+                    float *logitRow = logitsData + s * vocabSize;
+                    const float *embRow = dequantizedEmbeddings_.data.data() + static_cast<uint64_t>(i) * hiddenSize;
+                    logitRow[i] = dotProductFMA(hPtr, embRow, hiddenSize);
+                });
+            } else {
+                ThreadPool::instance().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
+                    uint32_t s = flatIdx / vocabSize;
+                    uint32_t i = flatIdx % vocabSize;
+                    const float *hPtr = hiddenData + s * hiddenSize;
+                    float *logitRow = logitsData + s * vocabSize;
+                    float dot = 0.0f;
+                    uint32_t blockSize = ggmlBlockSize(quantizedEmbeddings_.type);
+                    uint32_t typeSize = ggmlTypeSize(quantizedEmbeddings_.type);
+                    uint32_t numBlocks = (hiddenSize + blockSize - 1) / blockSize;
+                    for (uint32_t b = 0; b < numBlocks; ++b) {
+                        uint64_t blockOffset = static_cast<uint64_t>(i) * numBlocks + b;
+                        const uint8_t *blockData = quantizedEmbeddings_.data.data() + blockOffset * typeSize;
+                        float blockOut[256];
+                        GGMLDequantize::dequantizeBlock(quantizedEmbeddings_.type, blockData, blockOut, blockSize);
+                        uint32_t start = b * blockSize;
+                        uint32_t n = std::min(blockSize, hiddenSize - start);
+                        dot += dotProductFMA(hPtr + start, blockOut, n);
+                    }
+                    logitRow[i] = dot;
+                });
             }
 #endif
         } else {
-            // Separate LM head (quantized) with OpenMP parallelization
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *hiddenPtr = hiddenData + s * hiddenSize;
+            // Separate LM head: consolidated single parallelFor over all (token, vocab) pairs
+            ThreadPool::instance().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
+                uint32_t s = flatIdx / vocabSize;
+                uint32_t i = flatIdx % vocabSize;
+                const float *hPtr = hiddenData + s * hiddenSize;
                 float *logitRow = logitsData + s * vocabSize;
-                LMHead::computeCPUSeparate(hiddenPtr, lmHead_.data.data(), lmHead_.type,
-                                           lmHead_.rows, lmHead_.cols, logitRow);
+                float dot = 0.0f;
+                uint32_t blockSize = ggmlBlockSize(lmHead_.type);
+                uint32_t typeSize = ggmlTypeSize(lmHead_.type);
+                uint32_t numBlocks = (hiddenSize + blockSize - 1) / blockSize;
+                for (uint32_t b = 0; b < numBlocks; ++b) {
+                    uint64_t blockOffset = static_cast<uint64_t>(i) * numBlocks + b;
+                    const uint8_t *blockData = lmHead_.data.data() + blockOffset * typeSize;
+                    float blockOut[256];
+                    GGMLDequantize::dequantizeBlock(lmHead_.type, blockData, blockOut, blockSize);
+                    uint32_t start = b * blockSize;
+                    uint32_t n = std::min(blockSize, hiddenSize - start);
+                    dot += dotProductFMA(hPtr + start, blockOut, n);
+                }
+                logitRow[i] = dot;
+            });
+        }
+
+        // Apply final logit softcapping (Gemma4 architecture)
+        if (config_.architecture == ARCH_GEMMA4 && config_.finalLogitSoftcapping > 0.0f) {
+            float cap = config_.finalLogitSoftcapping;
+            float invCap = 1.0f / cap;
+            for (uint32_t s = 0; s < seqLen; ++s) {
+                float *logitRow = logitsData + s * vocabSize;
+                for (uint32_t i = 0; i < vocabSize; ++i) {
+                    logitRow[i] = std::tanh(logitRow[i] * invCap) * cap;
+                }
             }
         }
 
@@ -1665,9 +2588,7 @@ namespace tinycoder {
                 tokenId < static_cast<int32_t>(quantizedEmbeddings_.vocabSize)) {
                 auto embRow = quantizedEmbeddings_.getRow(tokenId);
                 float *hRow = hiddenData + i * hiddenSize;
-                for (uint32_t j = 0; j < hiddenSize; ++j) {
-                    hRow[j] = embRow[j];
-                }
+                std::memcpy(hRow, embRow.data(), hiddenSize * sizeof(float));
             }
         }
 
@@ -1701,91 +2622,195 @@ namespace tinycoder {
         for (uint32_t layer = 0; layer < nLayers; ++layer) {
             auto &w = layers_[layer];
 
-            // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
-            const float *rmsNormAttnData = w.rmsNormAttn.data();
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                rmsNormInPlace(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
-                               rmsNormAttnData, hiddenSize);
-            }
+            // Check if this is an SSM layer for Qwen35MoE architecture
+            bool isSSMLayer = (config_.architecture == ARCH_QWEN35MOE &&
+                               config_.fullAttentionInterval > 0 &&
+                               (layer % config_.fullAttentionInterval) != 0 &&
+                               !w.ssmOut.empty());
 
-            // Q, K, V projections
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *hRowPtr = attnNormData + s * hiddenSize;
+            if (isSSMLayer) {
+                // ---- SSM (Mamba-style) block replaces attention ----
 
-                // Q
-                np::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
-                float *qRowPtr = qData + s * nHeads * headDim;
-                std::memcpy(qRowPtr, qRow.data(), nHeads * headDim * sizeof(float));
-                if (!w.attnQBias.empty()) {
-                    const float *qBias = w.attnQBias.data();
-                    for (uint32_t i = 0; i < nHeads * headDim; ++i)
-                        qRowPtr[i] += qBias[i];
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                const float *rmsNormAttnData = w.rmsNormAttn.data();
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    rmsNormSIMD(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
+                                rmsNormAttnData, hiddenSize);
                 }
 
-                // K
-                np::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
-                float *kRowPtr = kData + s * nKVHeads * headDim;
-                std::memcpy(kRowPtr, kRow.data(), nKVHeads * headDim * sizeof(float));
-                if (!w.attnKBias.empty()) {
-                    const float *kBias = w.attnKBias.data();
-                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                        kRowPtr[i] += kBias[i];
+                // SSM computation for each token
+                uint32_t ssmInnerSize = config_.ssmInnerSize;
+                uint32_t ssmStateSize = config_.ssmStateSize;
+                uint32_t ssmConvKernel = config_.ssmConvKernel;
+
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *hRowPtr = attnNormData + s * hiddenSize;
+
+                    // Step 1: Input projection (hiddenSize → ssmInnerSize)
+                    np::Array<float> ssmIn = w.ssmOut.matMulVec(hRowPtr);
+                    float *ssmInData = ssmIn.data();
+
+                    // Step 2: Conv1d with past buffer
+                    std::vector<float> convOut(ssmInnerSize);
+                    if (ssmConvKernel > 1 && !w.ssmConv1d.empty()) {
+                        std::vector<float> convInput(ssmConvKernel * ssmInnerSize);
+                        auto &convBuf = kvCache_.ssmConvBuf[layer];
+                        uint32_t bufLen = ssmConvKernel - 1;
+                        std::memcpy(convInput.data(), convBuf.data(), bufLen * ssmInnerSize * sizeof(float));
+                        std::memcpy(convInput.data() + bufLen * ssmInnerSize,
+                                    ssmInData, ssmInnerSize * sizeof(float));
+
+                        std::memmove(convBuf.data(), convBuf.data() + ssmInnerSize,
+                                     (bufLen - 1) * ssmInnerSize * sizeof(float));
+                        std::memcpy(convBuf.data() + (bufLen - 1) * ssmInnerSize,
+                                    ssmInData, ssmInnerSize * sizeof(float));
+
+                        for (uint32_t c = 0; c < ssmInnerSize; ++c) {
+                            const float *wRow = reinterpret_cast<const float *>(w.ssmConv1d.data.data()) + static_cast<size_t>(c) * ssmConvKernel;
+                            convOut[c] = dotProductFMA(wRow, convInput.data() + c * ssmConvKernel, ssmConvKernel);
+                        }
+                    } else {
+                        std::memcpy(convOut.data(), ssmInData, ssmInnerSize * sizeof(float));
+                    }
+
+                    // Step 3: SiLU activation on conv output
+                    siluSIMD(convOut.data(), ssmInnerSize);
+
+                    // Step 4: SSM state update
+                    auto &ssmState = kvCache_.ssmState[layer];
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        float dt = std::log(1.0f + std::exp(w.ssmDtBias.data()[i]));
+                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                            float aVal = w.ssmA.data()[i * ssmStateSize + j];
+                            float aBar = std::exp(aVal * dt);
+                            uint32_t idx = i * ssmStateSize + j;
+                            ssmState[idx] = aBar * ssmState[idx] + convOut[i];
+                        }
+                    }
+
+                    // Step 5: Output from SSM state
+                    std::vector<float> ssmOut(ssmInnerSize);
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        double hVal = 0.0;
+                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                            hVal += ssmState[i * ssmStateSize + j];
+                        }
+                        float gate = w.ssmAlpha.data()[i] * static_cast<float>(hVal) + w.ssmBeta.data()[i];
+                        float gateAct = gate / (1.0f + std::exp(-gate));
+                        ssmOut[i] = convOut[i] * gateAct;
+                    }
+
+                    // Step 6: Output projection back to hiddenSize using attnO
+                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOut.data(),
+                                                               w.attnO.rows, w.attnO.cols);
+                    float *projPtr = attnProjData + s * hiddenSize;
+                    std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
                 }
 
-                // V
-                np::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
-                float *vRowPtr = vData + s * nKVHeads * headDim;
-                std::memcpy(vRowPtr, vRow.data(), nKVHeads * headDim * sizeof(float));
-                if (!w.attnVBias.empty()) {
-                    const float *vBias = w.attnVBias.data();
-                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                        vRowPtr[i] += vBias[i];
+                // SSM residual (standard residual, no post-norm)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    addSIMD(hiddenData + s * hiddenSize, attnProjData + s * hiddenSize, hiddenSize);
                 }
-            }
+            } else {
+                // ---- Attention block ----
 
-            // Apply RoPE
-            applyRoPE(qData, kData, seqLen, seqLen, nHeads, nKVHeads,
-                      static_cast<uint32_t>(kvCache_.pos));
-
-            // Store K, V in cache
-            uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
-            float *kCacheLayer =
-                    kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
-            float *vCacheLayer =
-                    kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
-
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *kSrc = kData + s * nKVHeads * headDim;
-                const float *vSrc = vData + s * nKVHeads * headDim;
-                float *kDst = kCacheLayer + (cachePos + s) * nKVHeads * headDim;
-                float *vDst = vCacheLayer + (cachePos + s) * nKVHeads * headDim;
-                uint32_t kvSize = nKVHeads * headDim;
-                for (uint32_t i = 0; i < kvSize; ++i) {
-                    kDst[i] = kSrc[i];
-                    vDst[i] = vSrc[i];
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                const float *rmsNormAttnData = w.rmsNormAttn.data();
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    rmsNormSIMD(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
+                                rmsNormAttnData, hiddenSize);
                 }
-            }
 
-            // Attention
-            uint32_t totalCacheLen = cachePos + seqLen;
-            attentionFused(qData, kCacheLayer, vCacheLayer, attnOutData, seqLen,
-                           cachePos, totalCacheLen, layer);
+                // Q, K, V projections (architecture-aware bias)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *hRowPtr = attnNormData + s * hiddenSize;
 
-            // Output projection (using dequantized F32 weights for exact float dot product)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *attnRowPtr = attnOutData + s * nHeads * headDim;
-                np::Array<float> projRow = deqMatMulVec(w.attnO_deq.data(), attnRowPtr,
-                                                        w.attnO.rows, w.attnO.cols);
-                float *projPtr = attnProjData + s * hiddenSize;
-                std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
-            }
+                    // Q
+                    np::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
+                    float *qRowPtr = qData + s * nHeads * headDim;
+                    std::memcpy(qRowPtr, qRow.data(), nHeads * headDim * sizeof(float));
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
+                        addSIMD(qRowPtr, w.attnQBias.data(), nHeads * headDim);
+                    }
 
-            // Residual: hidden += attnProj
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                float *hPtr = hiddenData + s * hiddenSize;
-                const float *aPtr = attnProjData + s * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hPtr[i] += aPtr[i];
+                    // K
+                    np::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
+                    float *kRowPtr = kData + s * nKVHeads * headDim;
+                    std::memcpy(kRowPtr, kRow.data(), nKVHeads * headDim * sizeof(float));
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
+                        addSIMD(kRowPtr, w.attnKBias.data(), nKVHeads * headDim);
+                    }
+
+                    // V
+                    np::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
+                    float *vRowPtr = vData + s * nKVHeads * headDim;
+                    std::memcpy(vRowPtr, vRow.data(), nKVHeads * headDim * sizeof(float));
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
+                        addSIMD(vRowPtr, w.attnVBias.data(), nKVHeads * headDim);
+                    }
+                }
+
+                // Apply Q/K norms before RoPE (Gemma4 and Qwen35MoE)
+                if (config_.architecture == ARCH_GEMMA4 && !w.attnQNorm.empty() && !w.attnKNorm.empty()) {
+                    applyQKNorms(qData, kData, seqLen, nHeads, nKVHeads,
+                                 w.attnQNorm.data(), w.attnKNorm.data());
+                } else if (config_.architecture == ARCH_QWEN35MOE && !w.attnQNormMoe.empty() && !w.attnKNormMoe.empty()) {
+                    applyQKNorms(qData, kData, seqLen, nHeads, nKVHeads,
+                                 w.attnQNormMoe.data(), w.attnKNormMoe.data());
+                }
+
+                // Apply RoPE
+                applyRoPE(qData, kData, seqLen, seqLen, nHeads, nKVHeads,
+                          static_cast<uint32_t>(kvCache_.pos));
+
+                // Store K, V in cache
+                uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
+                float *kCacheLayer =
+                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                float *vCacheLayer =
+                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *kSrc = kData + s * nKVHeads * headDim;
+                    const float *vSrc = vData + s * nKVHeads * headDim;
+                    float *kDst = kCacheLayer + (cachePos + s) * nKVHeads * headDim;
+                    float *vDst = vCacheLayer + (cachePos + s) * nKVHeads * headDim;
+                    uint32_t kvSize = nKVHeads * headDim;
+                    std::memcpy(kDst, kSrc, kvSize * sizeof(float));
+                    std::memcpy(vDst, vSrc, kvSize * sizeof(float));
+                }
+
+                // Attention
+                uint32_t totalCacheLen = cachePos + seqLen;
+                attentionFused(qData, kCacheLayer, vCacheLayer, attnOutData, seqLen,
+                               cachePos, totalCacheLen, layer);
+
+                // Output projection (using dequantized F32 weights for exact float dot product)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *attnRowPtr = attnOutData + s * nHeads * headDim;
+                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
+                                                               w.attnO.rows, w.attnO.cols);
+                    float *projPtr = attnProjData + s * hiddenSize;
+                    std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
+                }
+
+                // Attention residual + post-attention processing (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4 && !w.postAttnNorm.empty()) {
+                    // Gemma4: post-attention norm + layer scale
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *hPtr = hiddenData + s * hiddenSize;
+                        const float *aPtr = attnProjData + s * hiddenSize;
+                        addSIMD(hPtr, aPtr, hiddenSize);
+                        rmsNormSIMD(hPtr, hPtr, w.postAttnNorm.data(), hiddenSize);
+                        if (!w.layerOutputScale.empty()) {
+                            scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        addSIMD(hiddenData + s * hiddenSize, attnProjData + s * hiddenSize, hiddenSize);
+                    }
                 }
             }
 
@@ -1794,43 +2819,89 @@ namespace tinycoder {
             // RMSNorm: ffnNorm = rmsNorm(hidden, w.rmsNormFFN)
             const float *rmsNormFFNData = w.rmsNormFFN.data();
             for (uint32_t s = 0; s < seqLen; ++s) {
-                rmsNormInPlace(hiddenData + s * hiddenSize, ffnNormData + s * hiddenSize,
-                               rmsNormFFNData, hiddenSize);
+                rmsNormSIMD(hiddenData + s * hiddenSize, ffnNormData + s * hiddenSize,
+                            rmsNormFFNData, hiddenSize);
             }
 
-            // SwiGLU FFN
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *ffnRowPtr = ffnNormData + s * hiddenSize;
+            // MoE path (expertCount > 0)
+            if (config_.architecture == ARCH_GEMMA4 && config_.expertCount > 0) {
+                computeGemma4MoE(ffnNormData, ffnOutData, seqLen, hiddenSize, intermediateSize, w);
+                // Residual + layer scale
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    float *hPtr = hiddenData + s * hiddenSize;
+                    const float *fPtr = ffnOutData + s * hiddenSize;
+                    addSIMD(hPtr, fPtr, hiddenSize);
+                    if (!w.layerOutputScale.empty()) {
+                        scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
+                    }
+                }
+            } else if (config_.architecture == ARCH_QWEN35MOE && config_.expertCount > 0) {
+                // Qwen35MoE MoE path
+                computeQwen35MoE(ffnNormData, ffnOutData, seqLen, hiddenSize, intermediateSize, w);
+                // Standard residual (no post-norm)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    addSIMD(hiddenData + s * hiddenSize, ffnOutData + s * hiddenSize, hiddenSize);
+                }
+            } else {
+                // Dense FFN path
 
-                // Gate projection
-                np::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
-                float *gatePtr = gateData + s * intermediateSize;
-                std::memcpy(gatePtr, gateRow.data(), intermediateSize * sizeof(float));
+                // FFN gate+up projections (architecture-aware activation)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *ffnRowPtr = ffnNormData + s * hiddenSize;
 
-                // Up projection
-                np::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
-                float *upPtr = upData + s * intermediateSize;
-                std::memcpy(upPtr, upRow.data(), intermediateSize * sizeof(float));
-            }
+                    // Gate projection
+                    np::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
+                    float *gatePtr = gateData + s * intermediateSize;
+                    std::memcpy(gatePtr, gateRow.data(), intermediateSize * sizeof(float));
 
-            // SwiGLU activation
-            swiGLUInPlace(gateData, upData, seqLen * intermediateSize);
+                    // Up projection
+                    np::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
+                    float *upPtr = upData + s * intermediateSize;
+                    std::memcpy(upPtr, upRow.data(), intermediateSize * sizeof(float));
+                }
 
-            // Down projection (using dequantized F32 weights for exact float dot product)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *ffnActPtr = gateData + s * intermediateSize;
-                np::Array<float> downRow = deqMatMulVec(w.ffnDown_deq.data(), ffnActPtr,
-                                                        w.ffnDown.rows, w.ffnDown.cols);
-                float *outPtr = ffnOutData + s * hiddenSize;
-                std::memcpy(outPtr, downRow.data(), hiddenSize * sizeof(float));
-            }
+                // FFN activation (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4) {
+                    // Gemma4: GeGLU activation (gelu(gate) * up)
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *gatePtr = gateData + s * intermediateSize;
+                        const float *upPtr = upData + s * intermediateSize;
+                        geluInPlace(gatePtr, intermediateSize);
+                        for (uint32_t i = 0; i < intermediateSize; ++i) {
+                            gatePtr[i] *= upPtr[i];
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: SwiGLU activation (silu(gate) * up)
+                    swiGLUSIMD(gateData, upData, seqLen * intermediateSize);
+                }
 
-            // Residual: hidden += ffnOut
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                float *hPtr = hiddenData + s * hiddenSize;
-                const float *fPtr = ffnOutData + s * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hPtr[i] += fPtr[i];
+                // Down projection (using dequantized F32 weights for exact float dot product)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *ffnActPtr = gateData + s * intermediateSize;
+                    np::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
+                                                               w.ffnDown.rows, w.ffnDown.cols);
+                    float *outPtr = ffnOutData + s * hiddenSize;
+                    std::memcpy(outPtr, downRow.data(), hiddenSize * sizeof(float));
+                }
+
+                // FFN residual + post-FFN processing (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4 && !w.postFFWNorm.empty()) {
+                    // Gemma4: post-FFN norm + layer scale
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *hPtr = hiddenData + s * hiddenSize;
+                        const float *fPtr = ffnOutData + s * hiddenSize;
+                        addSIMD(hPtr, fPtr, hiddenSize);
+                        rmsNormSIMD(hPtr, hPtr, w.postFFWNorm.data(), hiddenSize);
+                        if (!w.layerOutputScale.empty()) {
+                            scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        addSIMD(hiddenData + s * hiddenSize, ffnOutData + s * hiddenSize, hiddenSize);
+                    }
                 }
             }
         }
@@ -1838,8 +2909,8 @@ namespace tinycoder {
         // Final RMSNorm
         const float *finalNormData = finalNorm_.data();
         for (uint32_t s = 0; s < seqLen; ++s) {
-            rmsNormInPlace(hiddenData + s * hiddenSize, hiddenData + s * hiddenSize,
-                           finalNormData, hiddenSize);
+            rmsNormSIMD(hiddenData + s * hiddenSize, hiddenData + s * hiddenSize,
+                        finalNormData, hiddenSize);
         }
 
         // Save hidden state (after final RMSNorm, before LM head)
@@ -1850,28 +2921,71 @@ namespace tinycoder {
         float *logitsData = logits.data();
 
         if (lmHeadTied_) {
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *hPtr = hiddenData + s * hiddenSize;
-                float *logitRow = logitsData + s * vocabSize;
-                if (!dequantizedEmbeddings_.empty()) {
-                    LMHead::computeCPU(hPtr,
-                                       dequantizedEmbeddings_.data.data(),
-                                       dequantizedEmbeddings_.vocabSize,
-                                       dequantizedEmbeddings_.hiddenSize, logitRow);
-                } else {
-                    LMHead::computeCPUQuantized(hPtr,
-                                                quantizedEmbeddings_.data.data(),
-                                                quantizedEmbeddings_.type,
-                                                quantizedEmbeddings_.vocabSize,
-                                                quantizedEmbeddings_.hiddenSize, logitRow);
-                }
+            if (!dequantizedEmbeddings_.empty()) {
+                // Consolidated single parallelFor over all (token, vocab) pairs
+                ThreadPool::instance().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
+                    uint32_t s = flatIdx / vocabSize;
+                    uint32_t i = flatIdx % vocabSize;
+                    const float *hPtr = hiddenData + s * hiddenSize;
+                    float *logitRow = logitsData + s * vocabSize;
+                    const float *embRow = dequantizedEmbeddings_.data.data() + static_cast<uint64_t>(i) * hiddenSize;
+                    logitRow[i] = dotProductFMA(hPtr, embRow, hiddenSize);
+                });
+            } else {
+                ThreadPool::instance().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
+                    uint32_t s = flatIdx / vocabSize;
+                    uint32_t i = flatIdx % vocabSize;
+                    const float *hPtr = hiddenData + s * hiddenSize;
+                    float *logitRow = logitsData + s * vocabSize;
+                    float dot = 0.0f;
+                    uint32_t blockSize = ggmlBlockSize(quantizedEmbeddings_.type);
+                    uint32_t typeSize = ggmlTypeSize(quantizedEmbeddings_.type);
+                    uint32_t numBlocks = (hiddenSize + blockSize - 1) / blockSize;
+                    for (uint32_t b = 0; b < numBlocks; ++b) {
+                        uint64_t blockOffset = static_cast<uint64_t>(i) * numBlocks + b;
+                        const uint8_t *blockData = quantizedEmbeddings_.data.data() + blockOffset * typeSize;
+                        float blockOut[256];
+                        GGMLDequantize::dequantizeBlock(quantizedEmbeddings_.type, blockData, blockOut, blockSize);
+                        uint32_t start = b * blockSize;
+                        uint32_t n = std::min(blockSize, hiddenSize - start);
+                        dot += dotProductFMA(hPtr + start, blockOut, n);
+                    }
+                    logitRow[i] = dot;
+                });
             }
         } else {
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *hiddenPtr = hiddenData + s * hiddenSize;
+            // Separate LM head: consolidated single parallelFor
+            ThreadPool::instance().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
+                uint32_t s = flatIdx / vocabSize;
+                uint32_t i = flatIdx % vocabSize;
+                const float *hPtr = hiddenData + s * hiddenSize;
                 float *logitRow = logitsData + s * vocabSize;
-                LMHead::computeCPUSeparate(hiddenPtr, lmHead_.data.data(), lmHead_.type,
-                                           lmHead_.rows, lmHead_.cols, logitRow);
+                float dot = 0.0f;
+                uint32_t blockSize = ggmlBlockSize(lmHead_.type);
+                uint32_t typeSize = ggmlTypeSize(lmHead_.type);
+                uint32_t numBlocks = (hiddenSize + blockSize - 1) / blockSize;
+                for (uint32_t b = 0; b < numBlocks; ++b) {
+                    uint64_t blockOffset = static_cast<uint64_t>(i) * numBlocks + b;
+                    const uint8_t *blockData = lmHead_.data.data() + blockOffset * typeSize;
+                    float blockOut[256];
+                    GGMLDequantize::dequantizeBlock(lmHead_.type, blockData, blockOut, blockSize);
+                    uint32_t start = b * blockSize;
+                    uint32_t n = std::min(blockSize, hiddenSize - start);
+                    dot += dotProductFMA(hPtr + start, blockOut, n);
+                }
+                logitRow[i] = dot;
+            });
+        }
+
+        // Apply final logit softcapping (Gemma4 architecture)
+        if (config_.architecture == ARCH_GEMMA4 && config_.finalLogitSoftcapping > 0.0f) {
+            float cap = config_.finalLogitSoftcapping;
+            float invCap = 1.0f / cap;
+            for (uint32_t s = 0; s < seqLen; ++s) {
+                float *logitRow = logitsData + s * vocabSize;
+                for (uint32_t i = 0; i < vocabSize; ++i) {
+                    logitRow[i] = std::tanh(logitRow[i] * invCap) * cap;
+                }
             }
         }
 
@@ -1908,9 +3022,7 @@ namespace tinycoder {
                 tokenId < static_cast<int32_t>(quantizedEmbeddings_.vocabSize)) {
                 auto embRow = quantizedEmbeddings_.getRow(tokenId);
                 float *hRow = hiddenData + i * hiddenSize;
-                for (uint32_t j = 0; j < hiddenSize; ++j) {
-                    hRow[j] = embRow[j];
-                }
+                std::memcpy(hRow, embRow.data(), hiddenSize * sizeof(float));
             }
         }
 
@@ -1944,306 +3056,205 @@ namespace tinycoder {
         for (uint32_t layer = 0; layer < nLayers; ++layer) {
             auto &w = layers_[layer];
 
-            // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
-            const float *rmsNormAttnData = w.rmsNormAttn.data();
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                rmsNormInPlace(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
-                               rmsNormAttnData, hiddenSize);
-            }
+            // Check if this is an SSM layer for Qwen35MoE architecture
+            bool isSSMLayer = (config_.architecture == ARCH_QWEN35MOE &&
+                               config_.fullAttentionInterval > 0 &&
+                               (layer % config_.fullAttentionInterval) != 0 &&
+                               !w.ssmOut.empty());
 
-            // Debug: print attnNorm stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float nMin = attnNormData[(seqLen - 1) * hiddenSize], nMax = attnNormData[(seqLen - 1) * hiddenSize];
-                double nSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = attnNormData[(seqLen - 1) * hiddenSize + i];
-                    nMin = std::min(nMin, v);
-                    nMax = std::max(nMax, v);
-                    nSumSq += (double) v * v;
-                }
-                float nNorm = std::sqrt((float) (nSumSq / hiddenSize));
-                std::cout << "[DEBUG] Layer 0 attnNorm: last token min=" << nMin << " max=" << nMax << " rms=" << nNorm << std::endl;
-                // Print first 8 values for comparison with test
-                std::cout << "[DEBUG] Layer 0 attnNorm first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << attnNormData[(seqLen - 1) * hiddenSize + i] << " ";
-                std::cout << std::endl;
-                // Also print embedding first 8 for the last token
-                std::cout << "[DEBUG] Layer 0 embedding first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << hiddenData[(seqLen - 1) * hiddenSize + i] << " ";
-                std::cout << std::endl;
-            }
+            if (isSSMLayer) {
+                // ---- SSM (Mamba-style) block replaces attention ----
 
-            // Q, K, V projections
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *hRowPtr = attnNormData + s * hiddenSize;
-
-                // Q
-                np::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
-                float *qRowPtr = qData + s * nHeads * headDim;
-                std::memcpy(qRowPtr, qRow.data(), nHeads * headDim * sizeof(float));
-                if (!w.attnQBias.empty()) {
-                    const float *qBias = w.attnQBias.data();
-                    for (uint32_t i = 0; i < nHeads * headDim; ++i)
-                        qRowPtr[i] += qBias[i];
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                const float *rmsNormAttnData = w.rmsNormAttn.data();
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    rmsNormSIMD(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
+                                rmsNormAttnData, hiddenSize);
                 }
 
-                // K
-                np::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
-                float *kRowPtr = kData + s * nKVHeads * headDim;
-                std::memcpy(kRowPtr, kRow.data(), nKVHeads * headDim * sizeof(float));
-                if (!w.attnKBias.empty()) {
-                    const float *kBias = w.attnKBias.data();
-                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                        kRowPtr[i] += kBias[i];
-                }
+                // SSM computation for each token
+                uint32_t ssmInnerSize = config_.ssmInnerSize;
+                uint32_t ssmStateSize = config_.ssmStateSize;
+                uint32_t ssmConvKernel = config_.ssmConvKernel;
 
-                // V
-                np::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
-                float *vRowPtr = vData + s * nKVHeads * headDim;
-                std::memcpy(vRowPtr, vRow.data(), nKVHeads * headDim * sizeof(float));
-                if (!w.attnVBias.empty()) {
-                    const float *vBias = w.attnVBias.data();
-                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                        vRowPtr[i] += vBias[i];
-                }
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *hRowPtr = attnNormData + s * hiddenSize;
 
-                // DIAGNOSTIC: For layer 0 last token, compare raw matMulVec result (before bias)
-                // with direct matMulVecFused call to verify correctness
-                if (layer == 0 && s == seqLen - 1) {
-                    // qRow contains the raw matMulVec result (before bias)
-                    const float *qRaw = qRow.data();
-                    float qRawRms = 0.0f;
-                    for (uint32_t i = 0; i < w.attnQ.rows; ++i) qRawRms += qRaw[i] * qRaw[i];
-                    qRawRms = std::sqrt(qRawRms / w.attnQ.rows);
-                    std::cout << "[DIAG] Q raw (before bias) rms=" << qRawRms << std::endl;
-                    std::cout << "[DIAG] Q raw first 8: ";
-                    for (uint32_t i = 0; i < 8; ++i) std::cout << std::fixed << std::setprecision(6) << qRaw[i] << " ";
-                    std::cout << std::endl;
-                    // qRowPtr has bias added
-                    std::cout << "[DIAG] Q with bias first 8: ";
-                    for (uint32_t i = 0; i < 8; ++i) std::cout << std::fixed << std::setprecision(6) << qRowPtr[i] << " ";
-                    std::cout << std::endl;
-                    // Compare with reference: compute using dequantize+dot
-                    auto deqQ = GGMLDequantize::dequantize(w.attnQ.type, w.attnQ.data.data(),
-                                                           static_cast<uint64_t>(w.attnQ.rows) * w.attnQ.cols);
-                    std::vector<float> qRef(w.attnQ.rows, 0.0f);
-                    for (uint32_t j = 0; j < w.attnQ.rows; ++j) {
-                        double dot = 0.0;
-                        for (uint32_t i = 0; i < w.attnQ.cols; ++i)
-                            dot += (double) hRowPtr[i] * deqQ[static_cast<size_t>(j) * w.attnQ.cols + i];
-                        qRef[j] = (float) dot;
+                    // Step 1: Input projection (hiddenSize → ssmInnerSize)
+                    np::Array<float> ssmIn = w.ssmOut.matMulVec(hRowPtr);
+                    float *ssmInData = ssmIn.data();
+
+                    // Step 2: Conv1d with past buffer
+                    std::vector<float> convOut(ssmInnerSize);
+                    if (ssmConvKernel > 1 && !w.ssmConv1d.empty()) {
+                        std::vector<float> convInput(ssmConvKernel * ssmInnerSize);
+                        auto &convBuf = kvCache_.ssmConvBuf[layer];
+                        uint32_t bufLen = ssmConvKernel - 1;
+                        std::memcpy(convInput.data(), convBuf.data(), bufLen * ssmInnerSize * sizeof(float));
+                        std::memcpy(convInput.data() + bufLen * ssmInnerSize,
+                                    ssmInData, ssmInnerSize * sizeof(float));
+
+                        for (uint32_t i = 0; i < (bufLen - 1) * ssmInnerSize; ++i) {
+                            convBuf[i] = convBuf[i + ssmInnerSize];
+                        }
+                        std::memcpy(convBuf.data() + (bufLen - 1) * ssmInnerSize,
+                                    ssmInData, ssmInnerSize * sizeof(float));
+
+                        for (uint32_t c = 0; c < ssmInnerSize; ++c) {
+                            double dot = 0.0;
+                            const float *wRow = reinterpret_cast<const float *>(w.ssmConv1d.data.data()) + static_cast<size_t>(c) * ssmConvKernel;
+                            for (uint32_t k = 0; k < ssmConvKernel; ++k) {
+                                dot += static_cast<double>(wRow[k]) * convInput[c * ssmConvKernel + k];
+                            }
+                            convOut[c] = static_cast<float>(dot);
+                        }
+                    } else {
+                        std::memcpy(convOut.data(), ssmInData, ssmInnerSize * sizeof(float));
                     }
-                    float qRefRms = 0.0f;
-                    for (uint32_t i = 0; i < w.attnQ.rows; ++i) qRefRms += qRef[i] * qRef[i];
-                    qRefRms = std::sqrt(qRefRms / w.attnQ.rows);
-                    bool qMatch = true;
-                    for (uint32_t i = 0; i < w.attnQ.rows; ++i) {
-                        if (std::abs(qRaw[i] - qRef[i]) > 1e-4f) {
-                            qMatch = false;
-                            break;
+
+                    // Step 3: SiLU activation on conv output
+                    siluSIMD(convOut.data(), ssmInnerSize);
+
+                    // Step 4: SSM state update
+                    auto &ssmState = kvCache_.ssmState[layer];
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        float dt = std::log(1.0f + std::exp(w.ssmDtBias.data()[i]));
+                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                            float aVal = w.ssmA.data()[i * ssmStateSize + j];
+                            float aBar = std::exp(aVal * dt);
+                            uint32_t idx = i * ssmStateSize + j;
+                            ssmState[idx] = aBar * ssmState[idx] + convOut[i];
                         }
                     }
-                    std::cout << "[DIAG] Q ref (deq+dot) rms=" << qRefRms << " match=" << (qMatch ? "YES" : "NO") << std::endl;
-                    if (!qMatch) {
-                        std::cout << "[DIAG] Q ref first 8: ";
-                        for (uint32_t i = 0; i < 8; ++i) std::cout << std::fixed << std::setprecision(6) << qRef[i] << " ";
-                        std::cout << std::endl;
+
+                    // Step 5: Output from SSM state
+                    std::vector<float> ssmOut(ssmInnerSize);
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        double hVal = 0.0;
+                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                            hVal += ssmState[i * ssmStateSize + j];
+                        }
+                        float gate = w.ssmAlpha.data()[i] * static_cast<float>(hVal) + w.ssmBeta.data()[i];
+                        float gateAct = gate / (1.0f + std::exp(-gate));
+                        ssmOut[i] = convOut[i] * gateAct;
                     }
 
-                    // Same for K
-                    const float *kRaw = kRow.data();
-                    float kRawRms = 0.0f;
-                    for (uint32_t i = 0; i < w.attnK.rows; ++i) kRawRms += kRaw[i] * kRaw[i];
-                    kRawRms = std::sqrt(kRawRms / w.attnK.rows);
-                    std::cout << "[DIAG] K raw (before bias) rms=" << kRawRms << std::endl;
-                    std::cout << "[DIAG] K raw first 8: ";
-                    for (uint32_t i = 0; i < 8; ++i) std::cout << std::fixed << std::setprecision(6) << kRaw[i] << " ";
-                    std::cout << std::endl;
-                    auto deqK = GGMLDequantize::dequantize(w.attnK.type, w.attnK.data.data(),
-                                                           static_cast<uint64_t>(w.attnK.rows) * w.attnK.cols);
-                    std::vector<float> kRef(w.attnK.rows, 0.0f);
-                    for (uint32_t j = 0; j < w.attnK.rows; ++j) {
-                        double dot = 0.0;
-                        for (uint32_t i = 0; i < w.attnK.cols; ++i)
-                            dot += (double) hRowPtr[i] * deqK[static_cast<size_t>(j) * w.attnK.cols + i];
-                        kRef[j] = (float) dot;
+                    // Step 6: Output projection back to hiddenSize using attnO
+                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOut.data(),
+                                                               w.attnO.rows, w.attnO.cols);
+                    float *projPtr = attnProjData + s * hiddenSize;
+                    std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
+                }
+
+                // SSM residual (standard residual, no post-norm)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    addSIMD(hiddenData + s * hiddenSize, attnProjData + s * hiddenSize, hiddenSize);
+                }
+            } else {
+                // ---- Attention block ----
+
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                const float *rmsNormAttnData = w.rmsNormAttn.data();
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    rmsNormSIMD(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
+                                rmsNormAttnData, hiddenSize);
+                }
+
+
+                // Q, K, V projections
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *hRowPtr = attnNormData + s * hiddenSize;
+
+                    // Q
+                    np::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
+                    float *qRowPtr = qData + s * nHeads * headDim;
+                    std::memcpy(qRowPtr, qRow.data(), nHeads * headDim * sizeof(float));
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
+                        addSIMD(qRowPtr, w.attnQBias.data(), nHeads * headDim);
                     }
-                    float kRefRms = 0.0f;
-                    for (uint32_t i = 0; i < w.attnK.rows; ++i) kRefRms += kRef[i] * kRef[i];
-                    kRefRms = std::sqrt(kRefRms / w.attnK.rows);
-                    bool kMatch = true;
-                    for (uint32_t i = 0; i < w.attnK.rows; ++i) {
-                        if (std::abs(kRaw[i] - kRef[i]) > 1e-4f) {
-                            kMatch = false;
-                            break;
+
+                    // K
+                    np::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
+                    float *kRowPtr = kData + s * nKVHeads * headDim;
+                    std::memcpy(kRowPtr, kRow.data(), nKVHeads * headDim * sizeof(float));
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
+                        addSIMD(kRowPtr, w.attnKBias.data(), nKVHeads * headDim);
+                    }
+
+                    // V
+                    np::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
+                    float *vRowPtr = vData + s * nKVHeads * headDim;
+                    std::memcpy(vRowPtr, vRow.data(), nKVHeads * headDim * sizeof(float));
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
+                        addSIMD(vRowPtr, w.attnVBias.data(), nKVHeads * headDim);
+                    }
+                }
+
+
+                // Apply Q/K norms before RoPE (Gemma4 and Qwen35MoE)
+                if (config_.architecture == ARCH_GEMMA4 && !w.attnQNorm.empty() && !w.attnKNorm.empty()) {
+                    applyQKNorms(qData, kData, seqLen, nHeads, nKVHeads,
+                                 w.attnQNorm.data(), w.attnKNorm.data());
+                } else if (config_.architecture == ARCH_QWEN35MOE && !w.attnQNormMoe.empty() && !w.attnKNormMoe.empty()) {
+                    applyQKNorms(qData, kData, seqLen, nHeads, nKVHeads,
+                                 w.attnQNormMoe.data(), w.attnKNormMoe.data());
+                }
+
+                // Apply RoPE
+                applyRoPE(qData, kData, seqLen, seqLen, nHeads, nKVHeads,
+                          static_cast<uint32_t>(kvCache_.pos));
+
+
+                // Store K, V in cache
+                uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
+                float *kCacheLayer =
+                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                float *vCacheLayer =
+                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *kSrc = kData + s * nKVHeads * headDim;
+                    const float *vSrc = vData + s * nKVHeads * headDim;
+                    float *kDst = kCacheLayer + (cachePos + s) * nKVHeads * headDim;
+                    float *vDst = vCacheLayer + (cachePos + s) * nKVHeads * headDim;
+                    uint32_t kvSize = nKVHeads * headDim;
+                    std::memcpy(kDst, kSrc, kvSize * sizeof(float));
+                    std::memcpy(vDst, vSrc, kvSize * sizeof(float));
+                }
+
+                // Attention
+                uint32_t totalCacheLen = cachePos + seqLen;
+                attentionFused(qData, kCacheLayer, vCacheLayer, attnOutData, seqLen,
+                               cachePos, totalCacheLen, layer);
+
+
+                // Output projection (using dequantized F32 weights for exact float dot product)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *attnRowPtr = attnOutData + s * nHeads * headDim;
+                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
+                                                               w.attnO.rows, w.attnO.cols);
+                    float *projPtr = attnProjData + s * hiddenSize;
+                    std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
+                }
+
+
+                // Attention residual + post-attention processing (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4 && !w.postAttnNorm.empty()) {
+                    // Gemma4: post-attention norm + layer scale
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *hPtr = hiddenData + s * hiddenSize;
+                        const float *aPtr = attnProjData + s * hiddenSize;
+                        addSIMD(hPtr, aPtr, hiddenSize);
+                        rmsNormSIMD(hPtr, hPtr, w.postAttnNorm.data(), hiddenSize);
+                        if (!w.layerOutputScale.empty()) {
+                            scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
                         }
                     }
-                    std::cout << "[DIAG] K ref (deq+dot) rms=" << kRefRms << " match=" << (kMatch ? "YES" : "NO") << std::endl;
-                    if (!kMatch) {
-                        std::cout << "[DIAG] K ref first 8: ";
-                        for (uint32_t i = 0; i < 8; ++i) std::cout << std::fixed << std::setprecision(6) << kRef[i] << " ";
-                        std::cout << std::endl;
+                } else {
+                    // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        addSIMD(hiddenData + s * hiddenSize, attnProjData + s * hiddenSize, hiddenSize);
                     }
-
-                    // Same for V
-                    const float *vRaw = vRow.data();
-                    float vRawRms = 0.0f;
-                    for (uint32_t i = 0; i < w.attnV.rows; ++i) vRawRms += vRaw[i] * vRaw[i];
-                    vRawRms = std::sqrt(vRawRms / w.attnV.rows);
-                    std::cout << "[DIAG] V raw (before bias) rms=" << vRawRms << std::endl;
-                    auto deqV = GGMLDequantize::dequantize(w.attnV.type, w.attnV.data.data(),
-                                                           static_cast<uint64_t>(w.attnV.rows) * w.attnV.cols);
-                    std::vector<float> vRef(w.attnV.rows, 0.0f);
-                    for (uint32_t j = 0; j < w.attnV.rows; ++j) {
-                        double dot = 0.0;
-                        for (uint32_t i = 0; i < w.attnV.cols; ++i)
-                            dot += (double) hRowPtr[i] * deqV[static_cast<size_t>(j) * w.attnV.cols + i];
-                        vRef[j] = (float) dot;
-                    }
-                    float vRefRms = 0.0f;
-                    for (uint32_t i = 0; i < w.attnV.rows; ++i) vRefRms += vRef[i] * vRef[i];
-                    vRefRms = std::sqrt(vRefRms / w.attnV.rows);
-                    bool vMatch = true;
-                    for (uint32_t i = 0; i < w.attnV.rows; ++i) {
-                        if (std::abs(vRaw[i] - vRef[i]) > 1e-4f) {
-                            vMatch = false;
-                            break;
-                        }
-                    }
-                    std::cout << "[DIAG] V ref (deq+dot) rms=" << vRefRms << " match=" << (vMatch ? "YES" : "NO") << std::endl;
-                }
-            }
-
-            // Debug: print Q, K, V stats and first-8 values for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                auto printVecStats = [&](const float *data, uint32_t n, const std::string &label) {
-                    float mn = data[0], mx = data[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        float v = data[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
-                    }
-                    float r = std::sqrt((float) (ssq / n));
-                    std::cout << "[DEBUG] Layer 0 " << label << ": last token min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                };
-                // Print attnNorm input used for Q/K/V (should match test)
-                std::cout << "[DEBUG] Layer 0 attnNorm (input to Q/K/V) first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << attnNormData[(seqLen - 1) * hiddenSize + i] << " ";
-                std::cout << std::endl;
-                // Q stats + first 8 values (before bias)
-                printVecStats(qData + (seqLen - 1) * nHeads * headDim, nHeads * headDim, "Q (before RoPE)");
-                std::cout << "[DEBUG] Layer 0 Q (before bias) first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << qData[(seqLen - 1) * nHeads * headDim + i] << " ";
-                std::cout << std::endl;
-                // K stats + first 8 values (before bias)
-                printVecStats(kData + (seqLen - 1) * nKVHeads * headDim, nKVHeads * headDim, "K (before RoPE)");
-                std::cout << "[DEBUG] Layer 0 K (before bias) first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << kData[(seqLen - 1) * nKVHeads * headDim + i] << " ";
-                std::cout << std::endl;
-                // V stats + first 8 values
-                printVecStats(vData + (seqLen - 1) * nKVHeads * headDim, nKVHeads * headDim, "V");
-                std::cout << "[DEBUG] Layer 0 V first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << vData[(seqLen - 1) * nKVHeads * headDim + i] << " ";
-                std::cout << std::endl;
-            }
-
-            // Apply RoPE
-            applyRoPE(qData, kData, seqLen, seqLen, nHeads, nKVHeads,
-                      static_cast<uint32_t>(kvCache_.pos));
-
-            // Debug: print Q, K stats after RoPE for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                auto printVecStats = [&](const float *data, uint32_t n, const std::string &label) {
-                    float mn = data[0], mx = data[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        float v = data[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
-                    }
-                    float r = std::sqrt((float) (ssq / n));
-                    std::cout << "[DEBUG] Layer 0 " << label << ": last token min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                };
-                printVecStats(qData + (seqLen - 1) * nHeads * headDim, nHeads * headDim, "Q (after RoPE)");
-                printVecStats(kData + (seqLen - 1) * nKVHeads * headDim, nKVHeads * headDim, "K (after RoPE)");
-            }
-
-            // Store K, V in cache
-            uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
-            float *kCacheLayer =
-                    kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
-            float *vCacheLayer =
-                    kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
-
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *kSrc = kData + s * nKVHeads * headDim;
-                const float *vSrc = vData + s * nKVHeads * headDim;
-                float *kDst = kCacheLayer + (cachePos + s) * nKVHeads * headDim;
-                float *vDst = vCacheLayer + (cachePos + s) * nKVHeads * headDim;
-                uint32_t kvSize = nKVHeads * headDim;
-                for (uint32_t i = 0; i < kvSize; ++i) {
-                    kDst[i] = kSrc[i];
-                    vDst[i] = vSrc[i];
-                }
-            }
-
-            // Attention
-            uint32_t totalCacheLen = cachePos + seqLen;
-            attentionFused(qData, kCacheLayer, vCacheLayer, attnOutData, seqLen,
-                           cachePos, totalCacheLen, layer);
-
-            // Debug: print attention output stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float aMin = attnOutData[(seqLen - 1) * nHeads * headDim], aMax = attnOutData[(seqLen - 1) * nHeads * headDim];
-                double aSumSq = 0.0;
-                for (uint32_t i = 0; i < nHeads * headDim; ++i) {
-                    float v = attnOutData[(seqLen - 1) * nHeads * headDim + i];
-                    aMin = std::min(aMin, v);
-                    aMax = std::max(aMax, v);
-                    aSumSq += (double) v * v;
-                }
-                float aNorm = std::sqrt((float) (aSumSq / (nHeads * headDim)));
-                std::cout << "[DEBUG] Layer 0 attnOut: last token min=" << aMin << " max=" << aMax << " rms=" << aNorm << std::endl;
-            }
-
-            // Output projection (using dequantized F32 weights for exact float dot product)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *attnRowPtr = attnOutData + s * nHeads * headDim;
-                np::Array<float> projRow = deqMatMulVec(w.attnO_deq.data(), attnRowPtr,
-                                                        w.attnO.rows, w.attnO.cols);
-                float *projPtr = attnProjData + s * hiddenSize;
-                std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
-            }
-
-            // Debug: print attention projection stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float aMin = attnProjData[(seqLen - 1) * hiddenSize], aMax = attnProjData[(seqLen - 1) * hiddenSize];
-                double aSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = attnProjData[(seqLen - 1) * hiddenSize + i];
-                    aMin = std::min(aMin, v);
-                    aMax = std::max(aMax, v);
-                    aSumSq += (double) v * v;
-                }
-                float aNorm = std::sqrt((float) (aSumSq / hiddenSize));
-                std::cout << "[DEBUG] Layer 0 attnProj: last token min=" << aMin << " max=" << aMax << " rms=" << aNorm << std::endl;
-            }
-
-            // Residual: hidden += attnProj
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                float *hPtr = hiddenData + s * hiddenSize;
-                const float *aPtr = attnProjData + s * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hPtr[i] += aPtr[i];
                 }
             }
 
@@ -2252,126 +3263,106 @@ namespace tinycoder {
             // RMSNorm: ffnNorm = rmsNorm(hidden, w.rmsNormFFN)
             const float *rmsNormFFNData = w.rmsNormFFN.data();
             for (uint32_t s = 0; s < seqLen; ++s) {
-                rmsNormInPlace(hiddenData + s * hiddenSize, ffnNormData + s * hiddenSize,
-                               rmsNormFFNData, hiddenSize);
+                rmsNormSIMD(hiddenData + s * hiddenSize, ffnNormData + s * hiddenSize,
+                            rmsNormFFNData, hiddenSize);
             }
 
-            // Debug: print ffnNorm stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float nMin = ffnNormData[(seqLen - 1) * hiddenSize], nMax = ffnNormData[(seqLen - 1) * hiddenSize];
-                double nSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = ffnNormData[(seqLen - 1) * hiddenSize + i];
-                    nMin = std::min(nMin, v);
-                    nMax = std::max(nMax, v);
-                    nSumSq += (double) v * v;
-                }
-                float nNorm = std::sqrt((float) (nSumSq / hiddenSize));
-                std::cout << "[DEBUG] Layer 0 ffnNorm: last token min=" << nMin << " max=" << nMax << " rms=" << nNorm << std::endl;
-            }
 
-            // SwiGLU FFN
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *ffnRowPtr = ffnNormData + s * hiddenSize;
-
-                // Gate projection
-                np::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
-                float *gatePtr = gateData + s * intermediateSize;
-                std::memcpy(gatePtr, gateRow.data(), intermediateSize * sizeof(float));
-
-                // Up projection
-                np::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
-                float *upPtr = upData + s * intermediateSize;
-                std::memcpy(upPtr, upRow.data(), intermediateSize * sizeof(float));
-            }
-
-            // Debug: print gate and up stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                auto printVecStats = [&](const float *data, uint32_t n, const std::string &label) {
-                    float mn = data[0], mx = data[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        float v = data[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+            // MoE path (expertCount > 0)
+            if (config_.architecture == ARCH_GEMMA4 && config_.expertCount > 0) {
+                computeGemma4MoE(ffnNormData, ffnOutData, seqLen, hiddenSize, intermediateSize, w);
+                // Residual + layer scale
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    float *hPtr = hiddenData + s * hiddenSize;
+                    const float *fPtr = ffnOutData + s * hiddenSize;
+                    addSIMD(hPtr, fPtr, hiddenSize);
+                    if (!w.layerOutputScale.empty()) {
+                        scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
                     }
-                    float r = std::sqrt((float) (ssq / n));
-                    std::cout << "[DEBUG] Layer 0 " << label << ": last token min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                };
-                printVecStats(gateData + (seqLen - 1) * intermediateSize, intermediateSize, "ffnGate (before SwiGLU)");
-                printVecStats(upData + (seqLen - 1) * intermediateSize, intermediateSize, "ffnUp");
-            }
-
-            // SwiGLU activation
-            swiGLUInPlace(gateData, upData, seqLen * intermediateSize);
-
-            // Debug: print SwiGLU output stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float gMin = gateData[(seqLen - 1) * intermediateSize], gMax = gateData[(seqLen - 1) * intermediateSize];
-                double gSumSq = 0.0;
-                for (uint32_t i = 0; i < intermediateSize; ++i) {
-                    float v = gateData[(seqLen - 1) * intermediateSize + i];
-                    gMin = std::min(gMin, v);
-                    gMax = std::max(gMax, v);
-                    gSumSq += (double) v * v;
                 }
-                float gNorm = std::sqrt((float) (gSumSq / intermediateSize));
-                std::cout << "[DEBUG] Layer 0 swigluOut: last token min=" << gMin << " max=" << gMax << " rms=" << gNorm << std::endl;
-            }
-
-            // Down projection (using dequantized F32 weights for exact float dot product)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *ffnActPtr = gateData + s * intermediateSize;
-                np::Array<float> downRow = deqMatMulVec(w.ffnDown_deq.data(), ffnActPtr,
-                                                        w.ffnDown.rows, w.ffnDown.cols);
-                float *outPtr = ffnOutData + s * hiddenSize;
-                std::memcpy(outPtr, downRow.data(), hiddenSize * sizeof(float));
-            }
-
-            // Debug: print FFN down projection stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float fMin = ffnOutData[(seqLen - 1) * hiddenSize], fMax = ffnOutData[(seqLen - 1) * hiddenSize];
-                double fSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = ffnOutData[(seqLen - 1) * hiddenSize + i];
-                    fMin = std::min(fMin, v);
-                    fMax = std::max(fMax, v);
-                    fSumSq += (double) v * v;
+            } else if (config_.architecture == ARCH_QWEN35MOE && config_.expertCount > 0) {
+                // Qwen35MoE MoE path
+                computeQwen35MoE(ffnNormData, ffnOutData, seqLen, hiddenSize, intermediateSize, w);
+                // Standard residual (no post-norm)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    addSIMD(hiddenData + s * hiddenSize, ffnOutData + s * hiddenSize, hiddenSize);
                 }
-                float fNorm = std::sqrt((float) (fSumSq / hiddenSize));
-                std::cout << "[DEBUG] Layer 0 ffnDown: last token min=" << fMin << " max=" << fMax << " rms=" << fNorm << std::endl;
-            }
+            } else {
+                // Dense FFN path
 
-            // Residual: hidden += ffnOut
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                float *hPtr = hiddenData + s * hiddenSize;
-                const float *fPtr = ffnOutData + s * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hPtr[i] += fPtr[i];
-                }
-            }
+                // FFN gate+up projections (architecture-aware activation)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *ffnRowPtr = ffnNormData + s * hiddenSize;
 
-            // Debug: print hidden state stats for the last token after each layer
-            if (seqLen > 1) {
-                float hMin = hiddenData[(seqLen - 1) * hiddenSize], hMax = hiddenData[(seqLen - 1) * hiddenSize];
-                float hSumSq = 0.0f;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = hiddenData[(seqLen - 1) * hiddenSize + i];
-                    hMin = std::min(hMin, v);
-                    hMax = std::max(hMax, v);
-                    hSumSq += v * v;
+                    // Gate projection
+                    np::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
+                    float *gatePtr = gateData + s * intermediateSize;
+                    std::memcpy(gatePtr, gateRow.data(), intermediateSize * sizeof(float));
+
+                    // Up projection
+                    np::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
+                    float *upPtr = upData + s * intermediateSize;
+                    std::memcpy(upPtr, upRow.data(), intermediateSize * sizeof(float));
                 }
-                float hNorm = std::sqrt(hSumSq / hiddenSize);
-                std::cout << "[DEBUG] Layer " << layer << " after FFN: last token min=" << hMin << " max=" << hMax << " rms=" << hNorm << std::endl;
+
+
+                // FFN activation (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4) {
+                    // Gemma4: GeGLU activation (gelu(gate) * up)
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *gatePtr = gateData + s * intermediateSize;
+                        const float *upPtr = upData + s * intermediateSize;
+                        geluInPlace(gatePtr, intermediateSize);
+                        for (uint32_t i = 0; i < intermediateSize; ++i) {
+                            gatePtr[i] *= upPtr[i];
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: SwiGLU activation (silu(gate) * up)
+                    swiGLUSIMD(gateData, upData, seqLen * intermediateSize);
+                }
+
+
+                // Down projection (using dequantized F32 weights for exact float dot product)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *ffnActPtr = gateData + s * intermediateSize;
+                    np::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
+                                                               w.ffnDown.rows, w.ffnDown.cols);
+                    float *outPtr = ffnOutData + s * hiddenSize;
+                    std::memcpy(outPtr, downRow.data(), hiddenSize * sizeof(float));
+                }
+
+
+                // FFN residual + post-FFN processing (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4 && !w.postFFWNorm.empty()) {
+                    // Gemma4: post-FFN norm + layer scale
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *hPtr = hiddenData + s * hiddenSize;
+                        const float *fPtr = ffnOutData + s * hiddenSize;
+                        addSIMD(hPtr, fPtr, hiddenSize);
+                        rmsNormSIMD(hPtr, hPtr, w.postFFWNorm.data(), hiddenSize);
+                        if (!w.layerOutputScale.empty()) {
+                            scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *hPtr = hiddenData + s * hiddenSize;
+                        const float *fPtr = ffnOutData + s * hiddenSize;
+                        for (uint32_t i = 0; i < hiddenSize; ++i) {
+                            hPtr[i] += fPtr[i];
+                        }
+                    }
+                }
             }
         }
 
         // Final RMSNorm
         const float *finalNormData = finalNorm_.data();
         for (uint32_t s = 0; s < seqLen; ++s) {
-            rmsNormInPlace(hiddenData + s * hiddenSize, hiddenData + s * hiddenSize,
-                           finalNormData, hiddenSize);
+            rmsNormSIMD(hiddenData + s * hiddenSize, hiddenData + s * hiddenSize,
+                        finalNormData, hiddenSize);
         }
 
         // Update KV cache position
@@ -2406,9 +3397,7 @@ namespace tinycoder {
                 tokenId < static_cast<int32_t>(quantizedEmbeddings_.vocabSize)) {
                 auto embRow = quantizedEmbeddings_.getRow(tokenId);
                 float *hRow = hiddenData + i * hiddenSize;
-                for (uint32_t j = 0; j < hiddenSize; ++j) {
-                    hRow[j] = embRow[j];
-                }
+                std::memcpy(hRow, embRow.data(), hiddenSize * sizeof(float));
             }
         }
 
@@ -2446,207 +3435,206 @@ namespace tinycoder {
         for (uint32_t layer = 0; layer < nLayers; ++layer) {
             auto &w = layers_[layer];
 
-            // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
-            const float *rmsNormAttnData = w.rmsNormAttn.data();
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                rmsNormInPlace(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
-                               rmsNormAttnData, hiddenSize);
-            }
+            // Check if this is an SSM layer for Qwen35MoE architecture
+            bool isSSMLayer = (config_.architecture == ARCH_QWEN35MOE &&
+                               config_.fullAttentionInterval > 0 &&
+                               (layer % config_.fullAttentionInterval) != 0 &&
+                               !w.ssmOut.empty());
 
-            // Debug: print attnNorm stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float nMin = attnNormData[(seqLen - 1) * hiddenSize], nMax = attnNormData[(seqLen - 1) * hiddenSize];
-                double nSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = attnNormData[(seqLen - 1) * hiddenSize + i];
-                    nMin = std::min(nMin, v);
-                    nMax = std::max(nMax, v);
-                    nSumSq += (double) v * v;
-                }
-                float nNorm = std::sqrt((float) (nSumSq / hiddenSize));
-                std::cout << "[DEBUG-PL] Layer 0 attnNorm: last token min=" << nMin << " max=" << nMax << " rms=" << nNorm << std::endl;
-            }
+            if (isSSMLayer) {
+                // ---- SSM (Mamba-style) block replaces attention ----
 
-            // Q, K, V projections
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *hRowPtr = attnNormData + s * hiddenSize;
-
-                // Q
-                np::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
-                float *qRowPtr = qData + s * nHeads * headDim;
-                std::memcpy(qRowPtr, qRow.data(), nHeads * headDim * sizeof(float));
-                if (!w.attnQBias.empty()) {
-                    const float *qBias = w.attnQBias.data();
-                    for (uint32_t i = 0; i < nHeads * headDim; ++i)
-                        qRowPtr[i] += qBias[i];
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                const float *rmsNormAttnData = w.rmsNormAttn.data();
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    rmsNormSIMD(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
+                                rmsNormAttnData, hiddenSize);
                 }
 
-                // K
-                np::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
-                float *kRowPtr = kData + s * nKVHeads * headDim;
-                std::memcpy(kRowPtr, kRow.data(), nKVHeads * headDim * sizeof(float));
-                if (!w.attnKBias.empty()) {
-                    const float *kBias = w.attnKBias.data();
-                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                        kRowPtr[i] += kBias[i];
-                }
+                // SSM computation for each token
+                uint32_t ssmInnerSize = config_.ssmInnerSize;
+                uint32_t ssmStateSize = config_.ssmStateSize;
+                uint32_t ssmConvKernel = config_.ssmConvKernel;
 
-                // V
-                np::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
-                float *vRowPtr = vData + s * nKVHeads * headDim;
-                std::memcpy(vRowPtr, vRow.data(), nKVHeads * headDim * sizeof(float));
-                if (!w.attnVBias.empty()) {
-                    const float *vBias = w.attnVBias.data();
-                    for (uint32_t i = 0; i < nKVHeads * headDim; ++i)
-                        vRowPtr[i] += vBias[i];
-                }
-            }
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *hRowPtr = attnNormData + s * hiddenSize;
 
-            // Debug: print Q, K, V stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                auto printVecStats = [&](const float *data, uint32_t n, const std::string &label) {
-                    float mn = data[0], mx = data[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        float v = data[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+                    // Step 1: Input projection (hiddenSize → ssmInnerSize)
+                    np::Array<float> ssmIn = w.ssmOut.matMulVec(hRowPtr);
+                    float *ssmInData = ssmIn.data();
+
+                    // Step 2: Conv1d with past buffer
+                    std::vector<float> convOut(ssmInnerSize);
+                    if (ssmConvKernel > 1 && !w.ssmConv1d.empty()) {
+                        std::vector<float> convInput(ssmConvKernel * ssmInnerSize);
+                        auto &convBuf = kvCache_.ssmConvBuf[layer];
+                        uint32_t bufLen = ssmConvKernel - 1;
+                        std::memcpy(convInput.data(), convBuf.data(), bufLen * ssmInnerSize * sizeof(float));
+                        std::memcpy(convInput.data() + bufLen * ssmInnerSize,
+                                    ssmInData, ssmInnerSize * sizeof(float));
+
+                        for (uint32_t i = 0; i < (bufLen - 1) * ssmInnerSize; ++i) {
+                            convBuf[i] = convBuf[i + ssmInnerSize];
+                        }
+                        std::memcpy(convBuf.data() + (bufLen - 1) * ssmInnerSize,
+                                    ssmInData, ssmInnerSize * sizeof(float));
+
+                        for (uint32_t c = 0; c < ssmInnerSize; ++c) {
+                            double dot = 0.0;
+                            const float *wRow = reinterpret_cast<const float *>(w.ssmConv1d.data.data()) + static_cast<size_t>(c) * ssmConvKernel;
+                            for (uint32_t k = 0; k < ssmConvKernel; ++k) {
+                                dot += static_cast<double>(wRow[k]) * convInput[c * ssmConvKernel + k];
+                            }
+                            convOut[c] = static_cast<float>(dot);
+                        }
+                    } else {
+                        std::memcpy(convOut.data(), ssmInData, ssmInnerSize * sizeof(float));
                     }
-                    float r = std::sqrt((float) (ssq / n));
-                    std::cout << "[DEBUG-PL] Layer 0 " << label << ": last token min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                };
-                printVecStats(qData + (seqLen - 1) * nHeads * headDim, nHeads * headDim, "Q (before RoPE)");
-                printVecStats(kData + (seqLen - 1) * nKVHeads * headDim, nKVHeads * headDim, "K (before RoPE)");
-                printVecStats(vData + (seqLen - 1) * nKVHeads * headDim, nKVHeads * headDim, "V");
-            }
 
-            // Apply RoPE
-            applyRoPE(qData, kData, seqLen, seqLen, nHeads, nKVHeads,
-                      static_cast<uint32_t>(kvCache_.pos));
+                    // Step 3: SiLU activation on conv output
+                    siluSIMD(convOut.data(), ssmInnerSize);
 
-            // Debug: print Q, K stats after RoPE for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                auto printVecStats = [&](const float *data, uint32_t n, const std::string &label) {
-                    float mn = data[0], mx = data[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        float v = data[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+                    // Step 4: SSM state update
+                    auto &ssmState = kvCache_.ssmState[layer];
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        float dt = std::log(1.0f + std::exp(w.ssmDtBias.data()[i]));
+                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                            float aVal = w.ssmA.data()[i * ssmStateSize + j];
+                            float aBar = std::exp(aVal * dt);
+                            uint32_t idx = i * ssmStateSize + j;
+                            ssmState[idx] = aBar * ssmState[idx] + convOut[i];
+                        }
                     }
-                    float r = std::sqrt((float) (ssq / n));
-                    std::cout << "[DEBUG-PL] Layer 0 " << label << ": last token min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                };
-                printVecStats(qData + (seqLen - 1) * nHeads * headDim, nHeads * headDim, "Q (after RoPE)");
-                printVecStats(kData + (seqLen - 1) * nKVHeads * headDim, nKVHeads * headDim, "K (after RoPE)");
-            }
 
-            // Store K, V in cache
-            uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
-            float *kCacheLayer =
-                    kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
-            float *vCacheLayer =
-                    kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                    // Step 5: Output from SSM state
+                    std::vector<float> ssmOut(ssmInnerSize);
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        double hVal = 0.0;
+                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                            hVal += ssmState[i * ssmStateSize + j];
+                        }
+                        float gate = w.ssmAlpha.data()[i] * static_cast<float>(hVal) + w.ssmBeta.data()[i];
+                        float gateAct = gate / (1.0f + std::exp(-gate));
+                        ssmOut[i] = convOut[i] * gateAct;
+                    }
 
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *kSrc = kData + s * nKVHeads * headDim;
-                const float *vSrc = vData + s * nKVHeads * headDim;
-                float *kDst = kCacheLayer + (cachePos + s) * nKVHeads * headDim;
-                float *vDst = vCacheLayer + (cachePos + s) * nKVHeads * headDim;
-                uint32_t kvSize = nKVHeads * headDim;
-                for (uint32_t i = 0; i < kvSize; ++i) {
-                    kDst[i] = kSrc[i];
-                    vDst[i] = vSrc[i];
+                    // Step 6: Output projection back to hiddenSize using attnO
+                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOut.data(),
+                                                               w.attnO.rows, w.attnO.cols);
+                    float *projPtr = attnProjData + s * hiddenSize;
+                    std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
                 }
-            }
 
-            // Attention
-            uint32_t totalCacheLen = cachePos + seqLen;
-            attentionFused(qData, kCacheLayer, vCacheLayer, attnOutData, seqLen,
-                           cachePos, totalCacheLen, layer);
-
-            // Debug: print attention output stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float aMin = attnOutData[(seqLen - 1) * nHeads * headDim], aMax = attnOutData[(seqLen - 1) * nHeads * headDim];
-                double aSumSq = 0.0;
-                for (uint32_t i = 0; i < nHeads * headDim; ++i) {
-                    float v = attnOutData[(seqLen - 1) * nHeads * headDim + i];
-                    aMin = std::min(aMin, v);
-                    aMax = std::max(aMax, v);
-                    aSumSq += (double) v * v;
+                // SSM residual (standard residual, no post-norm)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    addSIMD(hiddenData + s * hiddenSize, attnProjData + s * hiddenSize, hiddenSize);
                 }
-                float aNorm = std::sqrt((float) (aSumSq / (nHeads * headDim)));
-                std::cout << "[DEBUG-PL] Layer 0 attnOut: last token min=" << aMin << " max=" << aMax << " rms=" << aNorm << std::endl;
-            }
+            } else {
+                // ---- Attention block ----
 
-            // Output projection (using dequantized F32 weights for exact float dot product)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *attnRowPtr = attnOutData + s * nHeads * headDim;
-                np::Array<float> projRow = deqMatMulVec(w.attnO_deq.data(), attnRowPtr,
-                                                        w.attnO.rows, w.attnO.cols);
-                float *projPtr = attnProjData + s * hiddenSize;
-                std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
-            }
-
-            // Debug: print attnProj stats for the last token
-            if (seqLen > 1) {
-                float aMin = attnProjData[(seqLen - 1) * hiddenSize], aMax = attnProjData[(seqLen - 1) * hiddenSize];
-                double aSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = attnProjData[(seqLen - 1) * hiddenSize + i];
-                    aMin = std::min(aMin, v);
-                    aMax = std::max(aMax, v);
-                    aSumSq += (double) v * v;
+                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                const float *rmsNormAttnData = w.rmsNormAttn.data();
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    rmsNormSIMD(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
+                                rmsNormAttnData, hiddenSize);
                 }
-                float aNorm = std::sqrt((float) (aSumSq / hiddenSize));
-                std::cout << "[DEBUG-PL] Layer " << layer << " attnProj: last token min=" << aMin << " max=" << aMax << " rms=" << aNorm << std::endl;
-            }
 
-            // Debug: print hidden state BEFORE attention residual for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float hMin = hiddenData[(seqLen - 1) * hiddenSize], hMax = hiddenData[(seqLen - 1) * hiddenSize];
-                double hSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = hiddenData[(seqLen - 1) * hiddenSize + i];
-                    hMin = std::min(hMin, v);
-                    hMax = std::max(hMax, v);
-                    hSumSq += (double) v * v;
-                }
-                float hNorm = std::sqrt((float) (hSumSq / hiddenSize));
-                std::cout << "[DEBUG-PL] Layer 0 hidden BEFORE attn residual: last token min=" << hMin << " max=" << hMax << " rms=" << hNorm << std::endl;
-                std::cout << "[DEBUG-PL] Layer 0 hidden BEFORE attn residual first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << hiddenData[(seqLen - 1) * hiddenSize + i] << " ";
-                std::cout << std::endl;
-            }
 
-            // Residual: hidden += attnProj
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                float *hPtr = hiddenData + s * hiddenSize;
-                const float *aPtr = attnProjData + s * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hPtr[i] += aPtr[i];
-                }
-            }
+                // Q, K, V projections
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *hRowPtr = attnNormData + s * hiddenSize;
 
-            // Debug: print hidden state AFTER attention residual for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float hMin = hiddenData[(seqLen - 1) * hiddenSize], hMax = hiddenData[(seqLen - 1) * hiddenSize];
-                double hSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = hiddenData[(seqLen - 1) * hiddenSize + i];
-                    hMin = std::min(hMin, v);
-                    hMax = std::max(hMax, v);
-                    hSumSq += (double) v * v;
+                    // Q
+                    np::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
+                    float *qRowPtr = qData + s * nHeads * headDim;
+                    std::memcpy(qRowPtr, qRow.data(), nHeads * headDim * sizeof(float));
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
+                        addSIMD(qRowPtr, w.attnQBias.data(), nHeads * headDim);
+                    }
+
+                    // K
+                    np::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
+                    float *kRowPtr = kData + s * nKVHeads * headDim;
+                    std::memcpy(kRowPtr, kRow.data(), nKVHeads * headDim * sizeof(float));
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
+                        addSIMD(kRowPtr, w.attnKBias.data(), nKVHeads * headDim);
+                    }
+
+                    // V
+                    np::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
+                    float *vRowPtr = vData + s * nKVHeads * headDim;
+                    std::memcpy(vRowPtr, vRow.data(), nKVHeads * headDim * sizeof(float));
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
+                        addSIMD(vRowPtr, w.attnVBias.data(), nKVHeads * headDim);
+                    }
                 }
-                float hNorm = std::sqrt((float) (hSumSq / hiddenSize));
-                std::cout << "[DEBUG-PL] Layer 0 hidden AFTER attn residual: last token min=" << hMin << " max=" << hMax << " rms=" << hNorm << std::endl;
-                std::cout << "[DEBUG-PL] Layer 0 hidden AFTER attn residual first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << hiddenData[(seqLen - 1) * hiddenSize + i] << " ";
-                std::cout << std::endl;
+
+
+                // Apply Q/K norms before RoPE (Gemma4 and Qwen35MoE)
+                if (config_.architecture == ARCH_GEMMA4 && !w.attnQNorm.empty() && !w.attnKNorm.empty()) {
+                    applyQKNorms(qData, kData, seqLen, nHeads, nKVHeads,
+                                 w.attnQNorm.data(), w.attnKNorm.data());
+                } else if (config_.architecture == ARCH_QWEN35MOE && !w.attnQNormMoe.empty() && !w.attnKNormMoe.empty()) {
+                    applyQKNorms(qData, kData, seqLen, nHeads, nKVHeads,
+                                 w.attnQNormMoe.data(), w.attnKNormMoe.data());
+                }
+
+                // Apply RoPE
+                applyRoPE(qData, kData, seqLen, seqLen, nHeads, nKVHeads,
+                          static_cast<uint32_t>(kvCache_.pos));
+
+
+                // Store K, V in cache
+                uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
+                float *kCacheLayer =
+                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                float *vCacheLayer =
+                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *kSrc = kData + s * nKVHeads * headDim;
+                    const float *vSrc = vData + s * nKVHeads * headDim;
+                    float *kDst = kCacheLayer + (cachePos + s) * nKVHeads * headDim;
+                    float *vDst = vCacheLayer + (cachePos + s) * nKVHeads * headDim;
+                    uint32_t kvSize = nKVHeads * headDim;
+                    std::memcpy(kDst, kSrc, kvSize * sizeof(float));
+                    std::memcpy(vDst, vSrc, kvSize * sizeof(float));
+                }
+
+                // Attention
+                uint32_t totalCacheLen = cachePos + seqLen;
+                attentionFused(qData, kCacheLayer, vCacheLayer, attnOutData, seqLen,
+                               cachePos, totalCacheLen, layer);
+
+
+                // Output projection (using dequantized F32 weights for exact float dot product)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *attnRowPtr = attnOutData + s * nHeads * headDim;
+                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
+                                                               w.attnO.rows, w.attnO.cols);
+                    float *projPtr = attnProjData + s * hiddenSize;
+                    std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
+                }
+
+
+                // Attention residual + post-attention processing (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4 && !w.postAttnNorm.empty()) {
+                    // Gemma4: post-attention norm + layer scale
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *hPtr = hiddenData + s * hiddenSize;
+                        const float *aPtr = attnProjData + s * hiddenSize;
+                        addSIMD(hPtr, aPtr, hiddenSize);
+                        rmsNormSIMD(hPtr, hPtr, w.postAttnNorm.data(), hiddenSize);
+                        if (!w.layerOutputScale.empty()) {
+                            scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        addSIMD(hiddenData + s * hiddenSize, attnProjData + s * hiddenSize, hiddenSize);
+                    }
+                }
             }
 
             // ---- FFN block ----
@@ -2654,123 +3642,100 @@ namespace tinycoder {
             // RMSNorm: ffnNorm = rmsNorm(hidden, w.rmsNormFFN)
             const float *rmsNormFFNData = w.rmsNormFFN.data();
             for (uint32_t s = 0; s < seqLen; ++s) {
-                rmsNormInPlace(hiddenData + s * hiddenSize, ffnNormData + s * hiddenSize,
-                               rmsNormFFNData, hiddenSize);
+                rmsNormSIMD(hiddenData + s * hiddenSize, ffnNormData + s * hiddenSize,
+                            rmsNormFFNData, hiddenSize);
             }
 
-            // Debug: print ffnNorm stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float nMin = ffnNormData[(seqLen - 1) * hiddenSize], nMax = ffnNormData[(seqLen - 1) * hiddenSize];
-                double nSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = ffnNormData[(seqLen - 1) * hiddenSize + i];
-                    nMin = std::min(nMin, v);
-                    nMax = std::max(nMax, v);
-                    nSumSq += (double) v * v;
-                }
-                float nNorm = std::sqrt((float) (nSumSq / hiddenSize));
-                std::cout << "[DEBUG-PL] Layer 0 ffnNorm: last token min=" << nMin << " max=" << nMax << " rms=" << nNorm << std::endl;
-                std::cout << "[DEBUG-PL] Layer 0 ffnNorm first 8: ";
-                for (uint32_t i = 0; i < 8; ++i)
-                    std::cout << std::fixed << std::setprecision(6) << ffnNormData[(seqLen - 1) * hiddenSize + i] << " ";
-                std::cout << std::endl;
-            }
 
-            // SwiGLU FFN
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *ffnRowPtr = ffnNormData + s * hiddenSize;
-
-                // Gate projection
-                np::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
-                float *gatePtr = gateData + s * intermediateSize;
-                std::memcpy(gatePtr, gateRow.data(), intermediateSize * sizeof(float));
-
-                // Up projection
-                np::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
-                float *upPtr = upData + s * intermediateSize;
-                std::memcpy(upPtr, upRow.data(), intermediateSize * sizeof(float));
-            }
-
-            // Debug: print gate and up stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                auto printVecStats = [&](const float *data, uint32_t n, const std::string &label) {
-                    float mn = data[0], mx = data[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        float v = data[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+            // MoE path (expertCount > 0)
+            if (config_.architecture == ARCH_GEMMA4 && config_.expertCount > 0) {
+                computeGemma4MoE(ffnNormData, ffnOutData, seqLen, hiddenSize, intermediateSize, w);
+                // Residual + layer scale
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    float *hPtr = hiddenData + s * hiddenSize;
+                    const float *fPtr = ffnOutData + s * hiddenSize;
+                    addSIMD(hPtr, fPtr, hiddenSize);
+                    if (!w.layerOutputScale.empty()) {
+                        scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
                     }
-                    float r = std::sqrt((float) (ssq / n));
-                    std::cout << "[DEBUG-PL] Layer 0 " << label << ": last token min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                };
-                printVecStats(gateData + (seqLen - 1) * intermediateSize, intermediateSize, "ffnGate (before SwiGLU)");
-                printVecStats(upData + (seqLen - 1) * intermediateSize, intermediateSize, "ffnUp");
-            }
-
-            // SwiGLU activation
-            swiGLUInPlace(gateData, upData, seqLen * intermediateSize);
-
-            // Debug: print SwiGLU output stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float gMin = gateData[(seqLen - 1) * intermediateSize], gMax = gateData[(seqLen - 1) * intermediateSize];
-                double gSumSq = 0.0;
-                for (uint32_t i = 0; i < intermediateSize; ++i) {
-                    float v = gateData[(seqLen - 1) * intermediateSize + i];
-                    gMin = std::min(gMin, v);
-                    gMax = std::max(gMax, v);
-                    gSumSq += (double) v * v;
                 }
-                float gNorm = std::sqrt((float) (gSumSq / intermediateSize));
-                std::cout << "[DEBUG-PL] Layer 0 swigluOut: last token min=" << gMin << " max=" << gMax << " rms=" << gNorm << std::endl;
-            }
-
-            // Down projection (using dequantized F32 weights for exact float dot product)
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                const float *ffnActPtr = gateData + s * intermediateSize;
-                np::Array<float> downRow = deqMatMulVec(w.ffnDown_deq.data(), ffnActPtr,
-                                                        w.ffnDown.rows, w.ffnDown.cols);
-                float *outPtr = ffnOutData + s * hiddenSize;
-                std::memcpy(outPtr, downRow.data(), hiddenSize * sizeof(float));
-            }
-
-            // Debug: print FFN down projection stats for Layer 0
-            if (layer == 0 && seqLen > 1) {
-                float fMin = ffnOutData[(seqLen - 1) * hiddenSize], fMax = ffnOutData[(seqLen - 1) * hiddenSize];
-                double fSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = ffnOutData[(seqLen - 1) * hiddenSize + i];
-                    fMin = std::min(fMin, v);
-                    fMax = std::max(fMax, v);
-                    fSumSq += (double) v * v;
+            } else if (config_.architecture == ARCH_QWEN35MOE && config_.expertCount > 0) {
+                // Qwen35MoE MoE path
+                computeQwen35MoE(ffnNormData, ffnOutData, seqLen, hiddenSize, intermediateSize, w);
+                // Standard residual (no post-norm)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    addSIMD(hiddenData + s * hiddenSize, ffnOutData + s * hiddenSize, hiddenSize);
                 }
-                float fNorm = std::sqrt((float) (fSumSq / hiddenSize));
-                std::cout << "[DEBUG-PL] Layer 0 ffnDown: last token min=" << fMin << " max=" << fMax << " rms=" << fNorm << std::endl;
-            }
+            } else {
+                // Dense FFN path
 
-            // Residual: hidden += ffnOut
-            for (uint32_t s = 0; s < seqLen; ++s) {
-                float *hPtr = hiddenData + s * hiddenSize;
-                const float *fPtr = ffnOutData + s * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hPtr[i] += fPtr[i];
+                // FFN gate+up projections (architecture-aware activation)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *ffnRowPtr = ffnNormData + s * hiddenSize;
+
+                    // Gate projection
+                    np::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
+                    float *gatePtr = gateData + s * intermediateSize;
+                    std::memcpy(gatePtr, gateRow.data(), intermediateSize * sizeof(float));
+
+                    // Up projection
+                    np::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
+                    float *upPtr = upData + s * intermediateSize;
+                    std::memcpy(upPtr, upRow.data(), intermediateSize * sizeof(float));
+                }
+
+
+                // FFN activation (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4) {
+                    // Gemma4: GeGLU activation (gelu(gate) * up)
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *gatePtr = gateData + s * intermediateSize;
+                        const float *upPtr = upData + s * intermediateSize;
+                        geluInPlace(gatePtr, intermediateSize);
+                        for (uint32_t i = 0; i < intermediateSize; ++i) {
+                            gatePtr[i] *= upPtr[i];
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: SwiGLU activation (silu(gate) * up)
+                    swiGLUSIMD(gateData, upData, seqLen * intermediateSize);
+                }
+
+
+                // Down projection (using dequantized F32 weights for exact float dot product)
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *ffnActPtr = gateData + s * intermediateSize;
+                    np::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
+                                                               w.ffnDown.rows, w.ffnDown.cols);
+                    float *outPtr = ffnOutData + s * hiddenSize;
+                    std::memcpy(outPtr, downRow.data(), hiddenSize * sizeof(float));
+                }
+
+
+                // FFN residual + post-FFN processing (architecture-aware)
+                if (config_.architecture == ARCH_GEMMA4 && !w.postFFWNorm.empty()) {
+                    // Gemma4: post-FFN norm + layer scale
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *hPtr = hiddenData + s * hiddenSize;
+                        const float *fPtr = ffnOutData + s * hiddenSize;
+                        addSIMD(hPtr, fPtr, hiddenSize);
+                        rmsNormSIMD(hPtr, hPtr, w.postFFWNorm.data(), hiddenSize);
+                        if (!w.layerOutputScale.empty()) {
+                            scaleSIMD(hPtr, w.layerOutputScale.data()[0], hiddenSize);
+                        }
+                    }
+                } else {
+                    // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        float *hPtr = hiddenData + s * hiddenSize;
+                        const float *fPtr = ffnOutData + s * hiddenSize;
+                        for (uint32_t i = 0; i < hiddenSize; ++i) {
+                            hPtr[i] += fPtr[i];
+                        }
+                    }
                 }
             }
 
-            // Debug: print hidden state stats for the last token after each layer
-            if (seqLen > 1) {
-                float hMin = hiddenData[(seqLen - 1) * hiddenSize], hMax = hiddenData[(seqLen - 1) * hiddenSize];
-                double hSumSq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = hiddenData[(seqLen - 1) * hiddenSize + i];
-                    hMin = std::min(hMin, v);
-                    hMax = std::max(hMax, v);
-                    hSumSq += (double) v * v;
-                }
-                float hNorm = std::sqrt((float) (hSumSq / hiddenSize));
-                std::cout << "[DEBUG-PL] Layer " << layer << " after FFN: last token min=" << hMin << " max=" << hMax << " rms=" << hNorm << std::endl;
-            }
 
             // Capture hidden state after this layer's FFN residual
             perLayerStates.emplace_back(hiddenData, hiddenData + seqLen * hiddenSize);
@@ -2842,365 +3807,223 @@ namespace tinycoder {
                 std::fill(hidden.begin(), hidden.end(), 0.0f);
             }
 
-            // Debug: print embedding stats for the last token
-            if (pos == seqLen - 1) {
-                float mn = hidden[0], mx = hidden[0];
-                double ssq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = hidden[i];
-                    mn = std::min(mn, v);
-                    mx = std::max(mx, v);
-                    ssq += (double) v * v;
-                }
-                float r = std::sqrt((float) (ssq / hiddenSize));
-                std::cout << "[TBT] Embedding (last token): min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-            }
 
             for (uint32_t layer = 0; layer < nLayers; ++layer) {
                 auto &w = layers_[layer];
 
-                // ---- Attention block ----
+                bool isSSMLayer = (config_.architecture == ARCH_QWEN35MOE &&
+                                   config_.fullAttentionInterval > 0 &&
+                                   (layer % config_.fullAttentionInterval) != 0 &&
+                                   !w.ssmOut.empty());
 
-                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
-                rmsNormInPlace(hidden.data(), attnNorm.data(), w.rmsNormAttn.data(), hiddenSize);
+                if (isSSMLayer) {
+                    // ---- SSM block (replaces attention) ----
 
-                // Debug: print attnNorm stats for layer 0, last token
-                if (layer == 0 && pos == seqLen - 1) {
-                    float mn = attnNorm[0], mx = attnNorm[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < hiddenSize; ++i) {
-                        float v = attnNorm[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+                    // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                    rmsNormSIMD(hidden.data(), attnNorm.data(), w.rmsNormAttn.data(), hiddenSize);
+
+                    // SSM input projection: hiddenSize -> ssmInnerSize via ssmOut
+                    uint32_t ssmInnerSize = config_.ssmInnerSize;
+                    uint32_t ssmStateSize = config_.ssmStateSize;
+                    uint32_t ssmConvKernel = config_.ssmConvKernel;
+                    std::vector<float> ssmIn(ssmInnerSize);
+                    w.ssmOut.matMulVec(attnNorm.data(), ssmIn.data());
+
+                    // Conv1d with past buffer
+                    std::vector<float> convOut(ssmInnerSize);
+                    if (ssmConvKernel > 1 && !w.ssmConv1d.empty()) {
+                        std::vector<float> convInput(ssmConvKernel * ssmInnerSize);
+                        auto &convBuf = kvCache_.ssmConvBuf[layer];
+                        uint32_t bufLen = ssmConvKernel - 1;
+                        std::memcpy(convInput.data(), convBuf.data(), bufLen * ssmInnerSize * sizeof(float));
+                        std::memcpy(convInput.data() + bufLen * ssmInnerSize,
+                                    ssmIn.data(), ssmInnerSize * sizeof(float));
+
+                        for (uint32_t i = 0; i < (bufLen - 1) * ssmInnerSize; ++i) {
+                            convBuf[i] = convBuf[i + ssmInnerSize];
+                        }
+                        std::memcpy(convBuf.data() + (bufLen - 1) * ssmInnerSize,
+                                    ssmIn.data(), ssmInnerSize * sizeof(float));
+
+                        for (uint32_t c = 0; c < ssmInnerSize; ++c) {
+                            double dot = 0.0;
+                            const float *wRow = reinterpret_cast<const float *>(w.ssmConv1d.data.data()) + static_cast<size_t>(c) * ssmConvKernel;
+                            for (uint32_t k = 0; k < ssmConvKernel; ++k) {
+                                dot += static_cast<double>(wRow[k]) * convInput[c * ssmConvKernel + k];
+                            }
+                            convOut[c] = static_cast<float>(dot);
+                        }
+                    } else {
+                        std::memcpy(convOut.data(), ssmIn.data(), ssmInnerSize * sizeof(float));
                     }
-                    float r = std::sqrt((float) (ssq / hiddenSize));
-                    std::cout << "[TBT] Layer 0 attnNorm: min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                }
 
-                // Q projection (save raw matMulVec output before bias for diagnostic)
-                np::Array<float> qRowRaw;
-                {
-                    qRowRaw = w.attnQ.matMulVec(attnNorm.data());
-                    std::memcpy(q.data(), qRowRaw.data(), (nHeads * headDim) * sizeof(float));
-                    if (!w.attnQBias.empty()) {
-                        const float *biasData = w.attnQBias.data();
-                        for (uint32_t i = 0; i < nHeads * headDim; ++i) {
-                            q[i] += biasData[i];
-                        }
+                    // SiLU activation on conv output
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        convOut[i] = convOut[i] / (1.0f + std::exp(-convOut[i]));
                     }
-                }
 
-                // K projection (save raw matMulVec output before bias for diagnostic)
-                np::Array<float> kRowRaw;
-                {
-                    kRowRaw = w.attnK.matMulVec(attnNorm.data());
-                    std::memcpy(k.data(), kRowRaw.data(), (nKVHeads * headDim) * sizeof(float));
-                    if (!w.attnKBias.empty()) {
-                        const float *biasData = w.attnKBias.data();
-                        for (uint32_t i = 0; i < nKVHeads * headDim; ++i) {
-                            k[i] += biasData[i];
-                        }
-                    }
-                }
-
-                // V projection (save raw matMulVec output before bias for diagnostic)
-                np::Array<float> vRowRaw;
-                {
-                    vRowRaw = w.attnV.matMulVec(attnNorm.data());
-                    std::memcpy(v.data(), vRowRaw.data(), (nKVHeads * headDim) * sizeof(float));
-                    if (!w.attnVBias.empty()) {
-                        const float *biasData = w.attnVBias.data();
-                        for (uint32_t i = 0; i < nKVHeads * headDim; ++i) {
-                            v[i] += biasData[i];
-                        }
-                    }
-                }
-
-                // Debug: print Q, K, V stats for layer 0, last token
-                if (layer == 0 && pos == seqLen - 1) {
-                    auto printStats = [&](const float *data, uint32_t n, const std::string &label) {
-                        float mn = data[0], mx = data[0];
-                        double ssq = 0.0;
-                        for (uint32_t i = 0; i < n; ++i) {
-                            float v = data[i];
-                            mn = std::min(mn, v);
-                            mx = std::max(mx, v);
-                            ssq += (double) v * v;
-                        }
-                        float r = std::sqrt((float) (ssq / n));
-                        std::cout << "[TBT] Layer 0 " << label << ": min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                    };
-                    printStats(q.data(), nHeads * headDim, "Q (before RoPE, with bias)");
-                    printStats(k.data(), nKVHeads * headDim, "K (before RoPE, with bias)");
-                    printStats(v.data(), nKVHeads * headDim, "V (with bias)");
-
-                    // DIAGNOSTIC: Compare quantized matMulVec vs dequantized matMulVec for Q, K, V
-                    // Compare BEFORE bias addition to isolate matMulVec correctness
-                    {
-                        std::vector<float> qDeq = GGMLDequantize::dequantize(
-                                w.attnQ.type, w.attnQ.data.data(), (uint64_t) w.attnQ.rows * w.attnQ.cols);
-                        np::Array<float> qRef = deqMatMulVec(qDeq.data(), attnNorm.data(),
-                                                             w.attnQ.rows, w.attnQ.cols);
-                        double qDiffSq = 0.0;
-                        for (uint32_t i = 0; i < nHeads * headDim; ++i) {
-                            double d = qRowRaw.data()[i] - qRef.data()[i];
-                            qDiffSq += d * d;
-                        }
-                        float qRmse = std::sqrt((float) (qDiffSq / (nHeads * headDim)));
-                        std::cout << "[TBT] Layer 0 Q quant vs dequant (no bias) RMSE=" << qRmse;
-                        if (qRmse > 0.01f) std::cout << " *** LARGE DIFF ***";
-                        std::cout << std::endl;
-                        if (qRmse > 0.01f) {
-                            std::cout << "[TBT] Layer 0 Q quant first 8 (no bias): ";
-                            for (uint32_t i = 0; i < 8; ++i) std::cout << qRowRaw.data()[i] << " ";
-                            std::cout << std::endl;
-                            std::cout << "[TBT] Layer 0 Q dequant first 8: ";
-                            for (uint32_t i = 0; i < 8; ++i) std::cout << qRef.data()[i] << " ";
-                            std::cout << std::endl;
+                    // SSM state update
+                    auto &ssmState = kvCache_.ssmState[layer];
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        float dt = std::log(1.0f + std::exp(w.ssmDtBias.data()[i]));
+                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                            float aVal = w.ssmA.data()[i * ssmStateSize + j];
+                            float aBar = std::exp(aVal * dt);
+                            uint32_t idx = i * ssmStateSize + j;
+                            ssmState[idx] = aBar * ssmState[idx] + convOut[i];
                         }
                     }
-                    {
-                        std::vector<float> kDeq = GGMLDequantize::dequantize(
-                                w.attnK.type, w.attnK.data.data(), (uint64_t) w.attnK.rows * w.attnK.cols);
-                        np::Array<float> kRef = deqMatMulVec(kDeq.data(), attnNorm.data(),
-                                                             w.attnK.rows, w.attnK.cols);
-                        double kDiffSq = 0.0;
-                        for (uint32_t i = 0; i < nKVHeads * headDim; ++i) {
-                            double d = kRowRaw.data()[i] - kRef.data()[i];
-                            kDiffSq += d * d;
+
+                    // Output from SSM state
+                    std::vector<float> ssmOut(ssmInnerSize);
+                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
+                        double hVal = 0.0;
+                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
+                            hVal += ssmState[i * ssmStateSize + j];
                         }
-                        float kRmse = std::sqrt((float) (kDiffSq / (nKVHeads * headDim)));
-                        std::cout << "[TBT] Layer 0 K quant vs dequant (no bias) RMSE=" << kRmse;
-                        if (kRmse > 0.01f) std::cout << " *** LARGE DIFF ***";
-                        std::cout << std::endl;
-                        if (kRmse > 0.01f) {
-                            std::cout << "[TBT] Layer 0 K quant first 8 (no bias): ";
-                            for (uint32_t i = 0; i < 8; ++i) std::cout << kRowRaw.data()[i] << " ";
-                            std::cout << std::endl;
-                            std::cout << "[TBT] Layer 0 K dequant first 8: ";
-                            for (uint32_t i = 0; i < 8; ++i) std::cout << kRef.data()[i] << " ";
-                            std::cout << std::endl;
+                        float gate = w.ssmAlpha.data()[i] * static_cast<float>(hVal) + w.ssmBeta.data()[i];
+                        float gateAct = gate / (1.0f + std::exp(-gate));
+                        ssmOut[i] = convOut[i] * gateAct;
+                    }
+
+                    // Output projection back to hiddenSize using attnO
+                    deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOut.data(),
+                                    w.attnO.rows, w.attnO.cols,
+                                    attnProj.data());
+
+                    // SSM residual (standard residual, no post-norm)
+                    addSIMD(hidden.data(), attnProj.data(), hiddenSize);
+                } else {
+                    // ---- Attention block ----
+
+                    // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
+                    rmsNormSIMD(hidden.data(), attnNorm.data(), w.rmsNormAttn.data(), hiddenSize);
+
+                    // Fused QKV projection: single pass over x for all three projections
+                    matMulVecFusedQKV(w.attnQ, w.attnK, w.attnV, attnNorm.data(),
+                                      q.data(), k.data(), v.data());
+
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
+                        addSIMD(q.data(), w.attnQBias.data(), nHeads * headDim);
+                    }
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
+                        addSIMD(k.data(), w.attnKBias.data(), nKVHeads * headDim);
+                    }
+                    if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
+                        addSIMD(v.data(), w.attnVBias.data(), nKVHeads * headDim);
+                    }
+
+
+                    // Apply Q/K norms before RoPE (Gemma4 and Qwen35MoE)
+                    if (config_.architecture == ARCH_GEMMA4 && !w.attnQNorm.empty() && !w.attnKNorm.empty()) {
+                        applyQKNorms(q.data(), k.data(), 1, nHeads, nKVHeads,
+                                     w.attnQNorm.data(), w.attnKNorm.data());
+                    } else if (config_.architecture == ARCH_QWEN35MOE && !w.attnQNormMoe.empty() && !w.attnKNormMoe.empty()) {
+                        applyQKNorms(q.data(), k.data(), 1, nHeads, nKVHeads,
+                                     w.attnQNormMoe.data(), w.attnKNormMoe.data());
+                    }
+
+                    // Apply RoPE at position pos (single token, so qSeqLen=kSeqLen=1)
+                    applyRoPE(q.data(), k.data(), 1, 1, nHeads, nKVHeads, pos);
+
+
+                    // Store K, V in cache
+                    uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
+                    float *kCacheLayer =
+                            kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                    float *vCacheLayer =
+                            kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+
+                    uint32_t kvSize = nKVHeads * headDim;
+                    float *kDst = kCacheLayer + cachePos * kvSize;
+                    float *vDst = vCacheLayer + cachePos * kvSize;
+                    std::memcpy(kDst, k.data(), kvSize * sizeof(float));
+                    std::memcpy(vDst, v.data(), kvSize * sizeof(float));
+
+                    // Attention: single query against all cached positions
+                    uint32_t totalCacheLen = cachePos + 1;
+                    attentionFused(q.data(), kCacheLayer, vCacheLayer, attnOut.data(),
+                                   1, cachePos, totalCacheLen, layer);
+
+
+                    // Output projection (using dequantized F32 weights for exact float dot product)
+                    deqMatMulVecF16(w.attnO_deq_f16.data(), attnOut.data(),
+                                    w.attnO.rows, w.attnO.cols,
+                                    attnProj.data());
+
+
+                    // Attention residual + post-attention processing (architecture-aware)
+                    if (config_.architecture == ARCH_GEMMA4 && !w.postAttnNorm.empty()) {
+                        // Gemma4: post-attention norm + layer scale
+                        addSIMD(hidden.data(), attnProj.data(), hiddenSize);
+                        rmsNormSIMD(hidden.data(), hidden.data(), w.postAttnNorm.data(), hiddenSize);
+                        if (!w.layerOutputScale.empty()) {
+                            scaleSIMD(hidden.data(), w.layerOutputScale.data()[0], hiddenSize);
                         }
+                    } else {
+                        // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                        addSIMD(hidden.data(), attnProj.data(), hiddenSize);
                     }
-                    {
-                        std::vector<float> vDeq = GGMLDequantize::dequantize(
-                                w.attnV.type, w.attnV.data.data(), (uint64_t) w.attnV.rows * w.attnV.cols);
-                        np::Array<float> vRef = deqMatMulVec(vDeq.data(), attnNorm.data(),
-                                                             w.attnV.rows, w.attnV.cols);
-                        double vDiffSq = 0.0;
-                        for (uint32_t i = 0; i < nKVHeads * headDim; ++i) {
-                            double d = vRowRaw.data()[i] - vRef.data()[i];
-                            vDiffSq += d * d;
-                        }
-                        float vRmse = std::sqrt((float) (vDiffSq / (nKVHeads * headDim)));
-                        std::cout << "[TBT] Layer 0 V quant vs dequant (no bias) RMSE=" << vRmse;
-                        if (vRmse > 0.01f) std::cout << " *** LARGE DIFF ***";
-                        std::cout << std::endl;
-                        if (vRmse > 0.01f) {
-                            std::cout << "[TBT] Layer 0 V quant first 8 (no bias): ";
-                            for (uint32_t i = 0; i < 8; ++i) std::cout << vRowRaw.data()[i] << " ";
-                            std::cout << std::endl;
-                            std::cout << "[TBT] Layer 0 V dequant first 8: ";
-                            for (uint32_t i = 0; i < 8; ++i) std::cout << vRef.data()[i] << " ";
-                            std::cout << std::endl;
-                        }
-                    }
-                }
 
-                // Apply RoPE at position pos (single token, so qSeqLen=kSeqLen=1)
-                applyRoPE(q.data(), k.data(), 1, 1, nHeads, nKVHeads, pos);
-
-                // Debug: print Q, K stats after RoPE for layer 0, last token
-                if (layer == 0 && pos == seqLen - 1) {
-                    auto printStats = [&](const float *data, uint32_t n, const std::string &label) {
-                        float mn = data[0], mx = data[0];
-                        double ssq = 0.0;
-                        for (uint32_t i = 0; i < n; ++i) {
-                            float v = data[i];
-                            mn = std::min(mn, v);
-                            mx = std::max(mx, v);
-                            ssq += (double) v * v;
-                        }
-                        float r = std::sqrt((float) (ssq / n));
-                        std::cout << "[TBT] Layer 0 " << label << ": min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                    };
-                    printStats(q.data(), nHeads * headDim, "Q (after RoPE)");
-                    printStats(k.data(), nKVHeads * headDim, "K (after RoPE)");
-                }
-
-                // Store K, V in cache
-                uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
-                float *kCacheLayer =
-                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
-                float *vCacheLayer =
-                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
-
-                uint32_t kvSize = nKVHeads * headDim;
-                float *kDst = kCacheLayer + cachePos * kvSize;
-                float *vDst = vCacheLayer + cachePos * kvSize;
-                for (uint32_t i = 0; i < kvSize; ++i) {
-                    kDst[i] = k[i];
-                    vDst[i] = v[i];
-                }
-
-                // Attention: single query against all cached positions
-                uint32_t totalCacheLen = cachePos + 1;
-                attentionFused(q.data(), kCacheLayer, vCacheLayer, attnOut.data(),
-                               1, cachePos, totalCacheLen, layer);
-
-                // Debug: print attention output stats for layer 0, last token
-                if (layer == 0 && pos == seqLen - 1) {
-                    float mn = attnOut[0], mx = attnOut[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < nHeads * headDim; ++i) {
-                        float v = attnOut[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
-                    }
-                    float r = std::sqrt((float) (ssq / (nHeads * headDim)));
-                    std::cout << "[TBT] Layer 0 attnOut: min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                }
-
-                // Output projection (using dequantized F32 weights for exact float dot product)
-                {
-                    np::Array<float> projRow = deqMatMulVec(w.attnO_deq.data(), attnOut.data(),
-                                                            w.attnO.rows, w.attnO.cols);
-                    std::memcpy(attnProj.data(), projRow.data(), hiddenSize * sizeof(float));
-                }
-
-                // Debug: print attention projection stats for layer 0, last token
-                if (layer == 0 && pos == seqLen - 1) {
-                    float mn = attnProj[0], mx = attnProj[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < hiddenSize; ++i) {
-                        float v = attnProj[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
-                    }
-                    float r = std::sqrt((float) (ssq / hiddenSize));
-                    std::cout << "[TBT] Layer 0 attnProj: min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                }
-
-                // Residual: hidden += attnProj
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hidden[i] += attnProj[i];
-                }
-
-                // Debug: print hidden state AFTER attention residual for layer 0, last token
-                if (layer == 0 && pos == seqLen - 1) {
-                    float mn = hidden[0], mx = hidden[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < hiddenSize; ++i) {
-                        float v = hidden[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
-                    }
-                    float r = std::sqrt((float) (ssq / hiddenSize));
-                    std::cout << "[TBT] Layer 0 hidden AFTER attn residual: min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                    std::cout << "[TBT] Layer 0 hidden AFTER attn residual first 8: ";
-                    for (uint32_t i = 0; i < 8; ++i)
-                        std::cout << std::fixed << std::setprecision(6) << hidden[i] << " ";
-                    std::cout << std::endl;
-                }
+                }// end of else (attention block for non-SSM layers)
 
                 // ---- FFN block ----
 
                 // RMSNorm: ffnNorm = rmsNorm(hidden, w.rmsNormFFN)
-                rmsNormInPlace(hidden.data(), ffnNorm.data(), w.rmsNormFFN.data(), hiddenSize);
+                rmsNormSIMD(hidden.data(), ffnNorm.data(), w.rmsNormFFN.data(), hiddenSize);
 
-                // Debug: print ffnNorm stats for layer 0, last token
-                if (layer == 0 && pos == seqLen - 1) {
-                    float mn = ffnNorm[0], mx = ffnNorm[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < hiddenSize; ++i) {
-                        float v = ffnNorm[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+
+                // MoE path (expertCount > 0)
+                if (config_.architecture == ARCH_GEMMA4 && config_.expertCount > 0) {
+                    computeGemma4MoE(ffnNorm.data(), ffnOut.data(), 1, hiddenSize, intermediateSize, w);
+                    // Residual + layer scale
+                    addSIMD(hidden.data(), ffnOut.data(), hiddenSize);
+                    if (!w.layerOutputScale.empty()) {
+                        scaleSIMD(hidden.data(), w.layerOutputScale.data()[0], hiddenSize);
                     }
-                    float r = std::sqrt((float) (ssq / hiddenSize));
-                    std::cout << "[TBT] Layer 0 ffnNorm: min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                    std::cout << "[TBT] Layer 0 ffnNorm first 8: ";
-                    for (uint32_t i = 0; i < 8; ++i)
-                        std::cout << std::fixed << std::setprecision(6) << ffnNorm[i] << " ";
-                    std::cout << std::endl;
-                }
+                } else if (config_.architecture == ARCH_QWEN35MOE && config_.expertCount > 0) {
+                    // Qwen35MoE MoE path
+                    computeQwen35MoE(ffnNorm.data(), ffnOut.data(), 1, hiddenSize, intermediateSize, w);
+                    // Standard residual (no post-norm)
+                    addSIMD(hidden.data(), ffnOut.data(), hiddenSize);
+                } else {
+                    // Dense FFN path
+                    // Gate and up projections using out-parameter calls
+                    w.ffnGate.matMulVec(ffnNorm.data(), gate.data());
+                    w.ffnUp.matMulVec(ffnNorm.data(), up.data());
 
-                // Gate projection
-                {
-                    np::Array<float> gateRow = w.ffnGate.matMulVec(ffnNorm.data());
-                    std::memcpy(gate.data(), gateRow.data(), intermediateSize * sizeof(float));
-                }
 
-                // Up projection
-                {
-                    np::Array<float> upRow = w.ffnUp.matMulVec(ffnNorm.data());
-                    std::memcpy(up.data(), upRow.data(), intermediateSize * sizeof(float));
-                }
-
-                // Debug: print gate and up stats for layer 0, last token
-                if (layer == 0 && pos == seqLen - 1) {
-                    auto printStats = [&](const float *data, uint32_t n, const std::string &label) {
-                        float mn = data[0], mx = data[0];
-                        double ssq = 0.0;
-                        for (uint32_t i = 0; i < n; ++i) {
-                            float v = data[i];
-                            mn = std::min(mn, v);
-                            mx = std::max(mx, v);
-                            ssq += (double) v * v;
+                    // FFN activation (architecture-aware)
+                    if (config_.architecture == ARCH_GEMMA4) {
+                        // Gemma4: GeGLU activation (gelu(gate) * up)
+                        geluInPlace(gate.data(), intermediateSize);
+                        for (uint32_t i = 0; i < intermediateSize; ++i) {
+                            gate[i] *= up[i];
                         }
-                        float r = std::sqrt((float) (ssq / n));
-                        std::cout << "[TBT] Layer 0 " << label << ": min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                    };
-                    printStats(gate.data(), intermediateSize, "ffnGate (before SwiGLU)");
-                    printStats(up.data(), intermediateSize, "ffnUp");
-                }
-
-                // SwiGLU activation
-                swiGLUInPlace(gate.data(), up.data(), intermediateSize);
-
-                // Debug: print SwiGLU output stats for layer 0, last token
-                if (layer == 0 && pos == seqLen - 1) {
-                    float mn = gate[0], mx = gate[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < intermediateSize; ++i) {
-                        float v = gate[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+                    } else {
+                        // Qwen2, Qwen35MoE: SwiGLU activation (silu(gate) * up)
+                        swiGLUSIMD(gate.data(), up.data(), intermediateSize);
                     }
-                    float r = std::sqrt((float) (ssq / intermediateSize));
-                    std::cout << "[TBT] Layer 0 swigluOut: min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                }
 
-                // Down projection (using dequantized F32 weights for exact float dot product)
-                {
-                    np::Array<float> downRow = deqMatMulVec(w.ffnDown_deq.data(), gate.data(),
-                                                            w.ffnDown.rows, w.ffnDown.cols);
-                    std::memcpy(ffnOut.data(), downRow.data(), hiddenSize * sizeof(float));
-                }
 
-                // Debug: print FFN down projection stats for layer 0, last token
-                if (layer == 0 && pos == seqLen - 1) {
-                    float mn = ffnOut[0], mx = ffnOut[0];
-                    double ssq = 0.0;
-                    for (uint32_t i = 0; i < hiddenSize; ++i) {
-                        float v = ffnOut[i];
-                        mn = std::min(mn, v);
-                        mx = std::max(mx, v);
-                        ssq += (double) v * v;
+                    // Down projection (using dequantized F32 weights for exact float dot product)
+                    deqMatMulVecF16(w.ffnDown_deq_f16.data(), gate.data(),
+                                    w.ffnDown.rows, w.ffnDown.cols,
+                                    ffnOut.data());
+
+
+                    // FFN residual + post-FFN processing (architecture-aware)
+                    if (config_.architecture == ARCH_GEMMA4 && !w.postFFWNorm.empty()) {
+                        // Gemma4: post-FFN norm + layer scale
+                        addSIMD(hidden.data(), ffnOut.data(), hiddenSize);
+                        rmsNormSIMD(hidden.data(), hidden.data(), w.postFFWNorm.data(), hiddenSize);
+                        if (!w.layerOutputScale.empty()) {
+                            scaleSIMD(hidden.data(), w.layerOutputScale.data()[0], hiddenSize);
+                        }
+                    } else {
+                        // Qwen2, Qwen35MoE: standard residual (no post-norm)
+                        addSIMD(hidden.data(), ffnOut.data(), hiddenSize);
                     }
-                    float r = std::sqrt((float) (ssq / hiddenSize));
-                    std::cout << "[TBT] Layer 0 ffnDown: min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-                }
-
-                // Residual: hidden += ffnOut
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    hidden[i] += ffnOut[i];
                 }
 
                 // Store per-layer hidden state for the last token
@@ -3210,23 +4033,10 @@ namespace tinycoder {
             }
 
             // Final RMSNorm
-            rmsNormInPlace(hidden.data(), hidden.data(), finalNorm_.data(), hiddenSize);
+            rmsNormSIMD(hidden.data(), hidden.data(), finalNorm_.data(), hiddenSize);
 
             // Update KV cache position
             kvCache_.pos += 1;
-
-            if (pos == seqLen - 1 || pos < 5) {
-                float mn = hidden[0], mx = hidden[0];
-                double ssq = 0.0;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    float v = hidden[i];
-                    mn = std::min(mn, v);
-                    mx = std::max(mx, v);
-                    ssq += (double) v * v;
-                }
-                float r = std::sqrt((float) (ssq / hiddenSize));
-                std::cout << "[TBT] Token " << pos << " final hidden state: min=" << mn << " max=" << mx << " rms=" << r << std::endl;
-            }
         }
 
         // ---- LM Head for last token ----
@@ -3251,8 +4061,16 @@ namespace tinycoder {
                                        lmHead_.rows, lmHead_.cols, logits.data());
         }
 
+        // Apply final logit softcapping (Gemma4 architecture)
+        if (config_.architecture == ARCH_GEMMA4 && config_.finalLogitSoftcapping > 0.0f) {
+            float cap = config_.finalLogitSoftcapping;
+            float invCap = 1.0f / cap;
+            for (uint32_t i = 0; i < vocabSize; ++i) {
+                logits[i] = std::tanh(logits[i] * invCap) * cap;
+            }
+        }
+
         // Print per-layer hidden state stats for the last token
-        std::cout << "\n[TBT] Per-Layer Hidden States (last token, after FFN residual) ===" << std::endl;
         for (uint32_t layer = 0; layer < nLayers; ++layer) {
             float mn = perLayerStates[layer][0], mx = perLayerStates[layer][0];
             double ssq = 0.0;
@@ -3262,8 +4080,6 @@ namespace tinycoder {
                 mx = std::max(mx, v);
                 ssq += (double) v * v;
             }
-            float r = std::sqrt((float) (ssq / hiddenSize));
-            std::cout << "[TBT] Layer " << layer << ": min=" << mn << " max=" << mx << " rms=" << r << std::endl;
         }
 
         // Print top-10 logits
@@ -3273,7 +4089,6 @@ namespace tinycoder {
         std::partial_sort(top10.begin(), top10.begin() + 10, top10.end(),
                           [](const auto &a, const auto &b) { return a.first > b.first; });
 
-        std::cout << "\n[TBT] Top-10 Logits (last token):" << std::endl;
         for (int r = 0; r < 10 && r < (int) top10.size(); ++r) {
             std::cout << "  [" << r << "] id=" << top10[r].second
                       << " logit=" << std::fixed << std::setprecision(4) << top10[r].first << std::endl;
@@ -3415,11 +4230,57 @@ namespace tinycoder {
         return tokenizer_.encode(prompt);
     }
 
+    std::string Model::formatChat(
+            const std::vector<std::pair<std::string, std::string>> &messages,
+            bool addGenerationPrompt) const {
+        // If no chat template is available, fall back to architecture-specific default
+        if (config_.chatTemplate.empty()) {
+            if (config_.architecture == ARCH_GEMMA4) {
+                // Gemma4 default: <start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
+                std::string result;
+                for (const auto &msg: messages) {
+                    result += "<start_of_turn>" + msg.first + "\n" + msg.second + "<end_of_turn>\n";
+                }
+                if (addGenerationPrompt) {
+                    result += "<start_of_turn>model\n";
+                }
+                return result;
+            } else {
+                // Qwen2 / Qwen35MoE default: <|im_start|>role\n...<|im_end|>\n
+                std::string result;
+                for (const auto &msg: messages) {
+                    result += "<|im_start|>" + msg.first + "\n" + msg.second + "<|im_end|>\n";
+                }
+                if (addGenerationPrompt) {
+                    result += "<|im_start|>assistant\n";
+                }
+                return result;
+            }
+        }
+
+        // Use the dedicated Jinja template renderer
+        std::string rendered = ChatTemplateRenderer::render(config_.chatTemplate, messages, addGenerationPrompt);
+        // Print rendered prompt with escaped newlines for clarity
+        {
+            std::string escaped;
+            for (char c: rendered) {
+                if (c == '\n') escaped += "\\n";
+                else if (c == '\r')
+                    escaped += "\\r";
+                else if (c == '\t')
+                    escaped += "\\t";
+                else
+                    escaped += c;
+            }
+            std::cout << "[TinyCoder] Rendered prompt (" << rendered.size() << " chars): \"" << escaped << "\"" << std::endl;
+        }
+        return rendered;
+    }
+
     std::vector<int32_t>
     Model::generate(const std::string &prompt, const InferenceParams &params,
                     std::function<bool(int32_t, const std::string &)> callback) {
         if (!loaded_) {
-            std::cerr << "[TinyCoder] Model not loaded" << std::endl;
             return {};
         }
 
@@ -3431,26 +4292,13 @@ namespace tinycoder {
         // Tokenize prompt
         auto tokens = tokenize(prompt);
         if (tokens.empty()) {
-            std::cerr << "[TinyCoder] Empty prompt" << std::endl;
             return {};
         }
 
-        std::cout << "[TinyCoder] Prompt: " << tokens.size() << " tokens"
-                  << std::endl;
 
-        // Debug: print first 10 prompt tokens and their decoded text
-        std::cout << "[TinyCoder] Prompt tokens: ";
-        for (size_t i = 0; i < std::min<size_t>(tokens.size(), 10); ++i) {
-            std::cout << tokens[i] << " ";
-        }
         if (tokens.size() > 10)
             std::cout << "...";
         std::cout << std::endl;
-        std::cout << "[TinyCoder] Prompt decoded (first 100 chars): \""
-                  << tokenizer_.decode(
-                             std::vector<int32_t>(tokens.begin(),
-                                                  tokens.begin() + std::min<size_t>(tokens.size(), 20)))
-                  << "\"" << std::endl;
 
         // Prefill (process all prompt tokens at once)
         auto logits = forward(tokens);
@@ -3462,52 +4310,11 @@ namespace tinycoder {
             lastLogits.set(i, logits.get(lastIdx * config_.vocabSize + i));
         }
 
-        // Debug: print logit stats for the last prompt token
-        {
-            float minL = std::numeric_limits<float>::max();
-            float maxL = -std::numeric_limits<float>::max();
-            int nanL = 0, infL = 0;
-            for (uint32_t i = 0; i < config_.vocabSize; ++i) {
-                float v = lastLogits.get(i);
-                if (std::isnan(v))
-                    nanL++;
-                if (std::isinf(v))
-                    infL++;
-                minL = std::min(minL, v);
-                maxL = std::max(maxL, v);
-            }
-            std::cout << "[TinyCoder] Prefill logit stats: min=" << minL
-                      << " max=" << maxL << " nan=" << nanL << " inf=" << infL
-                      << std::endl;
-            // Print top-5 token IDs and their decoded text
-            std::vector<std::pair<float, int32_t>> top5;
-            for (uint32_t i = 0; i < config_.vocabSize; ++i) {
-                top5.emplace_back(lastLogits.get(i), static_cast<int32_t>(i));
-            }
-            std::partial_sort(top5.begin(), top5.begin() + 5, top5.end(),
-                              [](const auto &a, const auto &b) { return a.first > b.first; });
-            std::cout << "[TinyCoder] Top-5 prefill tokens:" << std::endl;
-            for (int r = 0; r < 5 && r < static_cast<int>(top5.size()); ++r) {
-                std::string dt = tokenizer_.decodeToken(top5[r].second);
-                // Sanitize output for display
-                std::string display;
-                for (char c: dt) {
-                    if (c >= 32 && c < 127)
-                        display += c;
-                    else
-                        display += "\\x" + std::to_string(static_cast<unsigned char>(c));
-                }
-                std::cout << "  [" << r << "] id=" << top5[r].second << " logit="
-                          << top5[r].first << " text=\"" << display << "\"" << std::endl;
-            }
-        }
 
         // Sample first generated token
         int32_t nextToken = sampleToken(lastLogits, params);
         std::string tokenText = tokenizer_.decodeToken(nextToken);
 
-        std::cout << "[TinyCoder] First sampled token: id=" << nextToken
-                  << " text=\"" << tokenText << "\"" << std::endl;
 
         std::vector<int32_t> generated;
         generated.push_back(nextToken);
@@ -3546,7 +4353,6 @@ namespace tinycoder {
 
             // Check for end of generation (multiple EOG tokens for Qwen2.5-Coder)
             if (tokenizer_.isEogToken(nextToken)) {
-                std::cout << "[TinyCoder] EOG token reached, stopping" << std::endl;
                 break;
             }
 
@@ -3556,28 +4362,7 @@ namespace tinycoder {
             if (!callback(nextToken, tokenText)) {
                 break;
             }
-
-            // Debug: print every 10th token
-            if ((i % 10) == 0) {
-                std::string display;
-                for (char c: tokenText) {
-                    if (c >= 32 && c < 127)
-                        display += c;
-                    else
-                        display += "\\x" + std::to_string(static_cast<unsigned char>(c));
-                }
-                std::cout << "[TinyCoder] Token " << i << ": id=" << nextToken
-                          << " text=\"" << display << "\"" << std::endl;
-            }
         }
-
-        auto t1 = std::chrono::high_resolution_clock::now();
-        auto ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-        float tokensPerSec = generated.size() / (ms / 1000.0f);
-
-        std::cout << "[TinyCoder] Generated " << generated.size() << " tokens in "
-                  << ms << " ms (" << tokensPerSec << " tok/s)" << std::endl;
 
         return generated;
     }

@@ -33,14 +33,15 @@ SOFTWARE.
 
 namespace tinycoder {
 
-    /// @brief Qwen2.5-Coder tokenizer (tiktoken-compatible BPE encoding).
+    /// @brief Multi-architecture tokenizer supporting tiktoken-compatible BPE
+    /// and SentencePiece-style tokenizers.
     ///
-    /// Supports the Qwen2.5-Coder tokenizer which uses:
-    /// - Byte-level BPE (tiktoken style, no explicit merge strings)
-    /// - Token scores for greedy merging (highest score = merge first)
-    /// - Special tokens: <|im_start|>, <|im_end|>, <|fim_prefix|>,
-    ///   <|fim_middle|>, <|fim_suffix|>
-    /// - Regex-based pre-tokenization (GPT-2 pattern)
+    /// Supports:
+    /// - Qwen2/Qwen35MoE: tiktoken-style BPE with token scores for greedy merging
+    /// - Gemma4: SentencePiece-style BPE with explicit merge strings
+    ///
+    /// Special tokens and BOS/EOS IDs are loaded from GGUF metadata and are
+    /// architecture-aware.
     class Tokenizer {
     public:
         Tokenizer() = default;
@@ -55,6 +56,12 @@ namespace tinycoder {
         /// @param vocabPath Path to vocab file (tiktoken .tiktoken or BPE .model)
         /// @return true if loading succeeded
         bool load(const std::string &vocabPath);
+
+        /// @brief Configure tokenizer for a specific model architecture.
+        /// Sets up special tokens, pre-tokenization regex, and BOS/EOS IDs
+        /// based on the architecture.
+        /// @param architecture Model architecture string (e.g., "qwen2", "gemma4", "qwen35moe")
+        void configureForArchitecture(const std::string &architecture);
 
         /// @brief Encode text to token IDs.
         /// @param text Input text
@@ -78,21 +85,19 @@ namespace tinycoder {
         bool isSpecialToken(int32_t token) const;
 
         /// @brief Check if a token ID is an end-of-generation token.
-        /// For generation, only <|endoftext|> (151643) stops generation.
-        /// <|im_end|> (151645) is part of normal chat output and should not stop.
+        /// Uses the EOS token ID loaded from GGUF metadata.
         bool isEogToken(int32_t token) const {
-            return token == 151643;
+            return token == eosTokenId_;
         }
 
-        // Special token IDs for Qwen2.5-Coder
-        int32_t bosTokenId() const { return 151643; }// <|endoftext|>
-        int32_t eosTokenId() const { return 151643; }// <|endoftext|>
-        int32_t padTokenId() const { return 151643; }
-        int32_t imStartId() const { return 151644; }  // <|im_start|>
-        int32_t imEndId() const { return 151645; }    // <|im_end|>
-        int32_t fimPrefixId() const { return 151659; }// <|fim_prefix|>
-        int32_t fimMiddleId() const { return 151660; }// <|fim_middle|>
-        int32_t fimSuffixId() const { return 151661; }// <|fim_suffix|>
+        // Special token IDs (loaded from GGUF metadata or configured per architecture)
+        int32_t bosTokenId() const { return bosTokenId_; }
+        int32_t eosTokenId() const { return eosTokenId_; }
+        int32_t padTokenId() const { return padTokenId_; }
+
+        // Qwen2-specific special token IDs (for chat template rendering)
+        int32_t imStartId() const { return imStartId_; }
+        int32_t imEndId() const { return imEndId_; }
 
     private:
         // Vocabulary: token ID -> token string
@@ -104,6 +109,10 @@ namespace tinycoder {
 
         // Special tokens set
         std::unordered_set<int32_t> specialTokens_;
+
+        // Special token text -> ID mappings for encode()
+        // These are populated by configureForArchitecture()
+        std::vector<std::pair<std::string, int32_t>> specialTokenTexts_;
 
         // Regex pattern for pre-tokenization (GPT-2 pattern)
         std::string pretokenizeRegex_;
@@ -123,6 +132,13 @@ namespace tinycoder {
         // Maps token IDs that represent single bytes back to their raw byte value.
         // Initialized during loadFromGGUF / load.
         std::unordered_map<int32_t, uint8_t> tokenIdToByte_;
+
+        // Special token IDs (loaded from GGUF metadata)
+        int32_t bosTokenId_ = 151643;// Default: Qwen2 <|endoftext|>
+        int32_t eosTokenId_ = 151643;// Default: Qwen2 <|endoftext|>
+        int32_t padTokenId_ = 151643;// Default: Qwen2 <|endoftext|>
+        int32_t imStartId_ = 151644; // Default: Qwen2 <|im_start|>
+        int32_t imEndId_ = 151645;   // Default: Qwen2 <|im_end|>
 
         /// @brief Get the string representation of a token, falling back to
         ///        byte-level decoding for tokens 0-255.

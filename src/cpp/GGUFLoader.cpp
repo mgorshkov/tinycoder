@@ -320,20 +320,124 @@ namespace tinycoder {
                     file_.read(reinterpret_cast<char *>(&arrayType), sizeof(uint32_t));
                     uint64_t arrayLen;
                     file_.read(reinterpret_cast<char *>(&arrayLen), sizeof(uint64_t));
-                    // Skip array elements to keep file position correct
-                    for (uint64_t j = 0; j < arrayLen; ++j) {
+                    // Store first element for numeric arrays (used by parseArchKey)
+                    // Some metadata (e.g. head_count_kv) is stored as per-layer arrays
+                    if (arrayLen > 0) {
                         switch (arrayType) {
+                            case GGUF_TYPE_UINT8: {
+                                uint8_t val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(uint8_t));
+                                metadata_[key] = std::to_string(val);
+                                // Skip remaining elements
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(1, std::ios::cur);
+                                }
+                                break;
+                            }
+                            case GGUF_TYPE_INT8: {
+                                int8_t val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(int8_t));
+                                metadata_[key] = std::to_string(val);
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(1, std::ios::cur);
+                                }
+                                break;
+                            }
+                            case GGUF_TYPE_UINT16: {
+                                uint16_t val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(uint16_t));
+                                metadata_[key] = std::to_string(val);
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(2, std::ios::cur);
+                                }
+                                break;
+                            }
+                            case GGUF_TYPE_INT16: {
+                                int16_t val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(int16_t));
+                                metadata_[key] = std::to_string(val);
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(2, std::ios::cur);
+                                }
+                                break;
+                            }
+                            case GGUF_TYPE_UINT32: {
+                                uint32_t val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(uint32_t));
+                                metadata_[key] = std::to_string(val);
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(4, std::ios::cur);
+                                }
+                                break;
+                            }
+                            case GGUF_TYPE_INT32: {
+                                int32_t val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(int32_t));
+                                metadata_[key] = std::to_string(val);
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(4, std::ios::cur);
+                                }
+                                break;
+                            }
+                            case GGUF_TYPE_FLOAT32: {
+                                float val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(float));
+                                metadata_[key] = std::to_string(val);
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(4, std::ios::cur);
+                                }
+                                break;
+                            }
+                            case GGUF_TYPE_BOOL: {
+                                uint8_t val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(uint8_t));
+                                metadata_[key] = val ? "true" : "false";
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(1, std::ios::cur);
+                                }
+                                break;
+                            }
+                            case GGUF_TYPE_UINT64: {
+                                uint64_t val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(uint64_t));
+                                metadata_[key] = std::to_string(val);
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(8, std::ios::cur);
+                                }
+                                break;
+                            }
+                            case GGUF_TYPE_INT64: {
+                                int64_t val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(int64_t));
+                                metadata_[key] = std::to_string(val);
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(8, std::ios::cur);
+                                }
+                                break;
+                            }
+                            case GGUF_TYPE_FLOAT64: {
+                                double val;
+                                file_.read(reinterpret_cast<char *>(&val), sizeof(double));
+                                metadata_[key] = std::to_string(val);
+                                for (uint64_t j = 1; j < arrayLen; ++j) {
+                                    file_.seekg(8, std::ios::cur);
+                                }
+                                break;
+                            }
                             case GGUF_TYPE_STRING: {
-                                uint64_t elemLen;
-                                file_.read(reinterpret_cast<char *>(&elemLen), sizeof(uint64_t));
-                                file_.seekg(elemLen, std::ios::cur);
+                                // String arrays (e.g. tokenizer.ggml.tokens) - skip all elements
+                                for (uint64_t j = 0; j < arrayLen; ++j) {
+                                    uint64_t elemLen;
+                                    file_.read(reinterpret_cast<char *>(&elemLen), sizeof(uint64_t));
+                                    file_.seekg(elemLen, std::ios::cur);
+                                }
                                 break;
                             }
                             default: {
-                                // Skip fixed-size elements (must advance file position!)
+                                // Unknown element type - skip all elements
                                 uint32_t elemSize = ggufValueTypeSize(arrayType);
                                 if (elemSize > 0) {
-                                    file_.seekg(elemSize, std::ios::cur);
+                                    file_.seekg(elemSize * arrayLen, std::ios::cur);
                                 }
                                 break;
                             }
@@ -347,29 +451,71 @@ namespace tinycoder {
                     return false;
             }
 
-            // Parse model configuration from metadata
+            // Parse model configuration from metadata (architecture-agnostic)
             if (key == "general.architecture") {
                 config_.architecture = metadata_[key];
             } else if (key == "general.name") {
                 config_.modelName = metadata_[key];
-            } else if (key == "qwen2.block_count") {
-                config_.numLayers = std::stoul(metadata_[key]);
-            } else if (key == "qwen2.context_length") {
-                config_.maxSeqLen = std::stoul(metadata_[key]);
-            } else if (key == "qwen2.embedding_length") {
-                config_.hiddenSize = std::stoul(metadata_[key]);
-            } else if (key == "qwen2.feed_forward_length") {
-                config_.intermediateSize = std::stoul(metadata_[key]);
-            } else if (key == "qwen2.attention.head_count") {
-                config_.numAttentionHeads = std::stoul(metadata_[key]);
-            } else if (key == "qwen2.attention.head_count_kv") {
-                config_.numKVHeads = std::stoul(metadata_[key]);
-            } else if (key == "qwen2.rope.freq_base") {
-                config_.ropeTheta = std::stof(metadata_[key]);
-            } else if (key == "tokenizer.ggml.vocab_size" ||
-                       key == "qwen2.vocab_size") {
+            } else if (key == "tokenizer.ggml.vocab_size") {
                 config_.vocabSize = std::stoul(metadata_[key]);
+            } else if (key == "tokenizer.chat_template") {
+                config_.chatTemplate = metadata_[key];
             }
+
+            // Architecture-specific keys - detect prefix from key
+            // We check for known architecture prefixes
+            auto parseArchKey = [&](const std::string &prefix) {
+                if (key == prefix + ".block_count") {
+                    config_.numLayers = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".context_length") {
+                    config_.maxSeqLen = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".embedding_length") {
+                    config_.hiddenSize = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".feed_forward_length") {
+                    config_.intermediateSize = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".attention.head_count") {
+                    config_.numAttentionHeads = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".attention.head_count_kv") {
+                    // KV heads may be an array (per-layer) - use first element
+                    // For now, just use the first value
+                    config_.numKVHeads = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".rope.freq_base") {
+                    config_.ropeTheta = std::stof(metadata_[key]);
+                } else if (key == prefix + ".vocab_size") {
+                    config_.vocabSize = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".final_logit_softcapping") {
+                    config_.finalLogitSoftcapping = std::stof(metadata_[key]);
+                } else if (key == prefix + ".expert_count") {
+                    config_.expertCount = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".expert_used_count") {
+                    config_.expertUsedCount = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".expert_feed_forward_length") {
+                    config_.expertFeedForwardLength = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".expert_shared_feed_forward_length") {
+                    config_.expertSharedFeedForwardLength = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".rope.dimension_count") {
+                    config_.ropeDimensionCount = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".full_attention_interval") {
+                    config_.fullAttentionInterval = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".ssm.inner_size") {
+                    config_.ssmInnerSize = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".ssm.state_size") {
+                    config_.ssmStateSize = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".ssm.conv_kernel") {
+                    config_.ssmConvKernel = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".ssm.group_count") {
+                    config_.ssmGroupCount = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".ssm.time_step_rank") {
+                    config_.ssmTimeStepRank = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".nextn_predict_layers") {
+                    config_.nextnPredictLayers = std::stoul(metadata_[key]);
+                }
+            };
+
+            // Try all known architecture prefixes
+            parseArchKey("qwen2");
+            parseArchKey("gemma4");
+            parseArchKey("qwen35moe");
         }
 
         config_.headDim = config_.hiddenSize / config_.numAttentionHeads;

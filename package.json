@@ -2,7 +2,7 @@
   "name": "tinycoder",
   "displayName": "TinyCoder AI",
   "description": "Local AI coding assistant powered by Qwen2.5-Coder, Gemma 4, and Qwen3.6 GGUF models. Native C++ inference with AVX2/AVX-512/AMX SIMD acceleration and CUDA GPU support. Runs entirely offline on limited resources.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "tinycoder",
   "license": "MIT",
   "repository": {
@@ -149,15 +149,15 @@
         "tinycoder.temperature": {
           "type": "number",
           "default": 0.7,
-          "minimum": 0.0,
-          "maximum": 2.0,
+          "minimum": 0,
+          "maximum": 2,
           "description": "Sampling temperature (higher = more creative)"
         },
         "tinycoder.topP": {
           "type": "number",
           "default": 0.9,
-          "minimum": 0.0,
-          "maximum": 1.0,
+          "minimum": 0,
+          "maximum": 1,
           "description": "Top-P nucleus sampling threshold"
         },
         "tinycoder.topK": {
@@ -170,8 +170,8 @@
         "tinycoder.repeatPenalty": {
           "type": "number",
           "default": 1.1,
-          "minimum": 1.0,
-          "maximum": 2.0,
+          "minimum": 1,
+          "maximum": 2,
           "description": "Repetition penalty"
         },
         "tinycoder.repeatLastN": {
@@ -198,10 +198,10 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
-    "typescript": "^5.3.0",
-    "eslint": "^8.56.0",
     "@typescript-eslint/eslint-plugin": "^6.19.0",
-    "@typescript-eslint/parser": "^6.19.0"
+    "@typescript-eslint/parser": "^6.19.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "node-addon-api": "^8.0.0"

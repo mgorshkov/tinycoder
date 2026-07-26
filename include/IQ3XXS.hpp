@@ -33,6 +33,8 @@ SOFTWARE.
 
 #include <np/Array.hpp>
 
+#include "ThreadPool.hpp"
+
 namespace tinycoder {
 
     /// @brief IQ3_XXS quantization constants and dequantization routines.
@@ -105,8 +107,7 @@ namespace tinycoder {
             uint32_t cols = w.cols;
             uint32_t bpr = w.blocksPerRow();
 
-#pragma omp parallel for
-            for (int32_t r = 0; r < static_cast<int32_t>(rows); ++r) {
+            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t r) {
                 const Block *rowBlks = w.rowBlocks(r);
                 float sum = 0.0f;
 
@@ -141,7 +142,7 @@ namespace tinycoder {
                     }
                 }
                 y[r] = sum;
-            }
+            });
         }
 
         /// @brief Dequantize a single block into np::Array<float>.
@@ -178,12 +179,11 @@ namespace tinycoder {
         static np::Array<float> dequantize(const Block *blocks, uint32_t numBlocks) {
             std::vector<float> result(numBlocks * BLOCK_SIZE);
 
-#pragma omp parallel for
-            for (int32_t b = 0; b < static_cast<int32_t>(numBlocks); ++b) {
+            ThreadPool::instance().parallelFor(0, numBlocks, [&](uint32_t b) {
                 auto deq = dequantizeBlock(blocks[b]);
                 std::memcpy(&result[b * BLOCK_SIZE], deq.data(),
                             BLOCK_SIZE * sizeof(float));
-            }
+            });
 
             return np::Array<float>(result, np::Shape{numBlocks * BLOCK_SIZE});
         }
@@ -195,8 +195,7 @@ namespace tinycoder {
 
             std::vector<float> result(rows * cols);
 
-#pragma omp parallel for
-            for (int32_t r = 0; r < static_cast<int32_t>(rows); ++r) {
+            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t r) {
                 for (uint32_t bc = 0; bc < blocksPerRow; ++bc) {
                     uint32_t blockIdx = r * blocksPerRow + bc;
                     auto deq = dequantizeBlock(blocks[blockIdx]);
@@ -207,7 +206,7 @@ namespace tinycoder {
                         result[r * cols + c] = static_cast<float>(deq.get(c - colStart));
                     }
                 }
-            }
+            });
 
             return np::Array<float>(result, np::Shape{rows, cols});
         }

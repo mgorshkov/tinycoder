@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.18.0)
 
 # TinyCoder - VS Code AI Coding Extension with Qwen2.5-Coder
 # Uses np library for NumPy-style arrays with SIMD (AVX2/AVX512/AMX) and CUDA GPU
-project(tinycoder VERSION 0.1.0 DESCRIPTION "VS Code AI Coding Assistant with Qwen2.5-Coder" LANGUAGES CXX)
+project(tinycoder VERSION 0.2.0 DESCRIPTION "VS Code AI Coding Assistant with Qwen2.5-Coder" LANGUAGES CXX)
+enable_testing()
 
 # ---- Options ----
 option(ENABLE_CUDA "Enable CUDA GPU acceleration" OFF)
@@ -96,6 +97,7 @@ message(STATUS "Node API headers: ${NODE_API_HEADER_DIR}")
 
 # ---- Source files ----
 set(TINYCODER_SOURCES
+    src/cpp/ChatTemplateRenderer.cpp
     src/cpp/GGUFLoader.cpp
     src/cpp/GridTables.cpp
     src/cpp/GridTablesIQ3S.cpp
@@ -103,6 +105,7 @@ set(TINYCODER_SOURCES
     src/cpp/QuantizedEmbedding.cpp
     src/cpp/QuantizedMatrix.cpp
     src/cpp/SIMDMatMulVec.cpp
+    src/cpp/ThreadPool.cpp
     src/cpp/Tokenizer.cpp
     src/cpp/Bridge.cpp
 )
@@ -116,11 +119,13 @@ if(ENABLE_CUDA)
 endif()
 
 set(TINYCODER_HEADERS
+    include/ChatTemplateRenderer.hpp
     include/ModelConfig.hpp
     include/GGUFLoader.hpp
     include/IQ3XXS.hpp
     include/LMHead.hpp
     include/LMHeadCUDA.hpp
+    include/ThreadPool.hpp
     include/Tokenizer.hpp
     include/Model.hpp
 )
@@ -156,11 +161,9 @@ if(ENABLE_CUDA)
     endif()
 endif()
 
-# Link OpenMP if enabled (np library was built with OpenMP)
-if(ENABLE_OPENMP)
-    find_package(OpenMP REQUIRED)
-    target_link_libraries(tinycoder_native PRIVATE OpenMP::OpenMP_CXX)
-endif()
+# Note: OpenMP is no longer used directly by TinyCoder.
+# The np library may still be built with OpenMP via its own CMake configuration.
+# ENABLE_OPENMP option is forwarded to np's FetchContent for that purpose.
 
 # ---- SIMD compile flags for SIMDMatMulVec.cpp ----
 # The file uses #ifdef guards to select the correct code path at compile time,
@@ -169,7 +172,7 @@ endif()
 # extensions, avoiding AVX/AVX-512/AMX code generation in other translation units.
 set(SIMD_MATMUL_FLAGS "")
 if(ENABLE_AVX2)
-    set(SIMD_MATMUL_FLAGS "${SIMD_MATMUL_FLAGS} -mavx2 -mfma")
+    set(SIMD_MATMUL_FLAGS "${SIMD_MATMUL_FLAGS} -mavx2 -mfma -mf16c")
 endif()
 # AVX-512 and AMX are not supported on this CPU, so these flags are disabled
 # if(ENABLE_AVX512)
@@ -210,7 +213,9 @@ endif()
 # ensuring consistent CUDA configuration across all test targets.
 
 set(TINYCODER_COMMON_SOURCES
+    src/cpp/ChatTemplateRenderer.cpp
     src/cpp/Model.cpp
+    src/cpp/ThreadPool.cpp
     src/cpp/Tokenizer.cpp
     src/cpp/QuantizedMatrix.cpp
     src/cpp/QuantizedEmbedding.cpp

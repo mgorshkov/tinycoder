@@ -44,13 +44,94 @@ namespace tinycoder {
     static const std::string QWEN2_PATTERN =
             R"('s|'t|'re|'ve|'m|'ll|'d| ?[[:alpha:]_]+| ?[[:digit:]]+| ?[^\s[:alpha:][:digit:]_]+|\s+(?!\S)|\s+)";
 
+    // Gemma4 pre-tokenization regex pattern (SentencePiece-style)
+    // Gemma4 uses a SentencePiece tokenizer with the standard unigram pattern.
+    // The pattern is similar to GPT-2 but without the underscore-in-word behavior.
+    static const std::string GEMMA4_PATTERN =
+            R"('s|'t|'re|'ve|'m|'ll|'d| ?[[:alpha:]]+| ?[[:digit:]]+| ?[^\s[:alpha:][:digit:]]+|\s+(?!\S)|\s+)";
+
+    void Tokenizer::configureForArchitecture(const std::string &architecture) {
+        if (architecture == "gemma4") {
+            // Gemma4 uses SentencePiece tokenizer
+            // BOS=2 (<bos>), EOS=1 (<eos>), PAD=0 (<pad>)
+            bosTokenId_ = 2;
+            eosTokenId_ = 1;
+            padTokenId_ = 0;
+            imStartId_ = -1;// Not used for Gemma4
+            imEndId_ = -1;  // Not used for Gemma4
+            pretokenizeRegex_ = GEMMA4_PATTERN;
+
+            // Gemma4 special tokens for encode()
+            specialTokenTexts_ = {
+                    {"<bos>", 2},
+                    {"<eos>", 1},
+                    {"<pad>", 0},
+                    {"<unk>", 3},
+            };
+        } else if (architecture == "qwen35moe") {
+            // Qwen35MoE uses tiktoken-style BPE (same as Qwen2)
+            // BOS/EOS=27 (<|endoftext|> equivalent)
+            bosTokenId_ = 27;
+            eosTokenId_ = 27;
+            padTokenId_ = 27;
+            imStartId_ = 151644;// <|im_start|>
+            imEndId_ = 151645;  // <|im_end|>
+            pretokenizeRegex_ = QWEN2_PATTERN;
+
+            // Qwen35MoE special tokens for encode()
+            specialTokenTexts_ = {
+                    {"<|endoftext|>", 27},
+                    {"<|im_start|>", 151644},
+                    {"<|im_end|>", 151645},
+            };
+        } else {
+            // Qwen2 default (tiktoken-style BPE)
+            bosTokenId_ = 151643;
+            eosTokenId_ = 151643;
+            padTokenId_ = 151643;
+            imStartId_ = 151644;
+            imEndId_ = 151645;
+            pretokenizeRegex_ = QWEN2_PATTERN;
+
+            // Qwen2 special tokens for encode()
+            specialTokenTexts_ = {
+                    {"<|endoftext|>", 151643},
+                    {"<|im_start|>", 151644},
+                    {"<|im_end|>", 151645},
+                    {"<|fim_prefix|>", 151659},
+                    {"<|fim_middle|>", 151660},
+                    {"<|fim_suffix|>", 151661},
+                    {"<|repo_name|>", 151662},
+                    {"<|file_sep|>", 151663},
+                    {"<|im_extra_id_0|>", 151664},
+            };
+        }
+
+        // Update special tokens set
+        specialTokens_.clear();
+        specialTokens_.insert(bosTokenId_);
+        specialTokens_.insert(eosTokenId_);
+        specialTokens_.insert(padTokenId_);
+        if (imStartId_ >= 0) specialTokens_.insert(imStartId_);
+        if (imEndId_ >= 0) specialTokens_.insert(imEndId_);
+    }
+
     bool Tokenizer::loadFromGGUF(const std::string &ggufPath) {
         // Load tokenizer data embedded in the GGUF file.
-        // Qwen2.5-Coder uses tiktoken-style BPE which stores:
+        // Supports both tiktoken-style (Qwen2, Qwen35MoE) and
+        // SentencePiece-style (Gemma4) tokenizers.
+        //
+        // Tiktoken-style stores:
         // - tokenizer.model: "gpt2"
         // - tokenizer.tokens: array of token strings
         // - tokenizer.scores: array of token scores (log probabilities)
         // - tokenizer.merges: NOT present in tiktoken-style tokenizers
+        //
+        // SentencePiece-style stores:
+        // - tokenizer.model: "gemma4" or "sentencepiece"
+        // - tokenizer.tokens: array of token strings
+        // - tokenizer.scores: array of token scores
+        // - tokenizer.merges: array of merge strings
         //
         // Tiktoken does NOT use explicit merge strings. Instead, it uses
         // token scores for greedy BPE merging: adjacent tokens whose
@@ -80,8 +161,10 @@ namespace tinycoder {
         // Scan metadata for tokenizer data
         bool foundTokens = false;
         bool foundScores = false;
+        bool foundMerges = false;
         std::vector<std::string> tokenStrings;
         std::vector<float> tokenScores;
+        std::vector<std::string> mergeStrings;
 
         for (uint64_t i = 0; i < metadataKVCount; ++i) {
             // Read key
@@ -125,26 +208,44 @@ namespace tinycoder {
                 }
                 foundScores = true;
             } else if (key == "tokenizer.ggml.merges") {
+                // SentencePiece-style tokenizers use explicit merge strings.
                 // Tiktoken-style tokenizers don't use explicit merges.
-                // Skip this array if present (some GGUF converters include it
-                // as an empty array or with placeholder data).
                 uint32_t arrayType;
                 file.read(reinterpret_cast<char *>(&arrayType), sizeof(uint32_t));
                 uint64_t arrayLen;
                 file.read(reinterpret_cast<char *>(&arrayLen), sizeof(uint64_t));
 
+                mergeStrings.reserve(arrayLen);
                 for (uint64_t j = 0; j < arrayLen; ++j) {
                     uint64_t strLen;
                     file.read(reinterpret_cast<char *>(&strLen), sizeof(uint64_t));
-                    file.seekg(strLen, std::ios::cur);
+                    std::string merge(strLen, '\0');
+                    file.read(merge.data(), strLen);
+                    mergeStrings.push_back(merge);
                 }
+                foundMerges = true;
             } else if (key == "tokenizer.ggml.model") {
                 // String value
                 uint64_t strLen;
                 file.read(reinterpret_cast<char *>(&strLen), sizeof(uint64_t));
                 std::string modelType(strLen, '\0');
                 file.read(modelType.data(), strLen);
-                // Expected: "gpt2" for BPE tokenizer
+                // Expected: "gpt2" for BPE tokenizer, "gemma4" or "sentencepiece" for SentencePiece
+            } else if (key == "tokenizer.ggml.bos_token_id") {
+                // Read BOS token ID (INT32)
+                int32_t bosId;
+                file.read(reinterpret_cast<char *>(&bosId), sizeof(int32_t));
+                bosTokenId_ = bosId;
+            } else if (key == "tokenizer.ggml.eos_token_id") {
+                // Read EOS token ID (INT32)
+                int32_t eosId;
+                file.read(reinterpret_cast<char *>(&eosId), sizeof(int32_t));
+                eosTokenId_ = eosId;
+            } else if (key == "tokenizer.ggml.padding_token_id") {
+                // Read PAD token ID (INT32)
+                int32_t padId;
+                file.read(reinterpret_cast<char *>(&padId), sizeof(int32_t));
+                padTokenId_ = padId;
             } else {
                 // Skip unknown metadata values
                 switch (valueType) {
@@ -178,13 +279,35 @@ namespace tinycoder {
                         uint64_t arrLen;
                         file.read(reinterpret_cast<char *>(&arrLen), sizeof(uint64_t));
                         // Skip elements based on type
-                        for (uint64_t j = 0; j < arrLen; ++j) {
-                            if (arrType == 8) {// String array
+                        // GGUF value types: 0=UINT8, 1=INT8, 2=UINT16, 3=INT16,
+                        // 4=UINT32, 5=INT32, 6=FLOAT32, 7=BOOL, 8=STRING,
+                        // 9=ARRAY, 10=UINT64, 11=INT64, 12=FLOAT64
+                        if (arrType == 8) {
+                            // String array: each element has a length prefix
+                            for (uint64_t j = 0; j < arrLen; ++j) {
                                 uint64_t elemLen;
                                 file.read(reinterpret_cast<char *>(&elemLen), sizeof(uint64_t));
                                 file.seekg(elemLen, std::ios::cur);
-                            } else {
-                                break;// Skip rest
+                            }
+                        } else if (arrType == 0 || arrType == 1 || arrType == 7) {
+                            // UINT8, INT8, BOOL: 1 byte each
+                            file.seekg(static_cast<std::streamoff>(arrLen), std::ios::cur);
+                        } else if (arrType == 2 || arrType == 3) {
+                            // UINT16, INT16: 2 bytes each
+                            file.seekg(static_cast<std::streamoff>(arrLen * 2), std::ios::cur);
+                        } else if (arrType == 4 || arrType == 5 || arrType == 6) {
+                            // UINT32, INT32, FLOAT32: 4 bytes each
+                            file.seekg(static_cast<std::streamoff>(arrLen * 4), std::ios::cur);
+                        } else if (arrType == 10 || arrType == 11 || arrType == 12) {
+                            // UINT64, INT64, FLOAT64: 8 bytes each
+                            file.seekg(static_cast<std::streamoff>(arrLen * 8), std::ios::cur);
+                        } else {
+                            // Unknown array type, skip by reading element size
+                            // (shouldn't happen with standard GGUF files)
+                            for (uint64_t j = 0; j < arrLen; ++j) {
+                                uint64_t elemLen;
+                                file.read(reinterpret_cast<char *>(&elemLen), sizeof(uint64_t));
+                                file.seekg(elemLen, std::ios::cur);
                             }
                         }
                         break;
@@ -234,19 +357,14 @@ namespace tinycoder {
         buildByteToTokenId();
 
         // Set up special tokens
-        specialTokens_.insert(bosTokenId());
-        specialTokens_.insert(eosTokenId());
-        specialTokens_.insert(imStartId());
-        specialTokens_.insert(imEndId());
-        specialTokens_.insert(fimPrefixId());
-        specialTokens_.insert(fimMiddleId());
-        specialTokens_.insert(fimSuffixId());
-
-        // Set pre-tokenization regex
-        pretokenizeRegex_ = QWEN2_PATTERN;
+        specialTokens_.insert(bosTokenId_);
+        specialTokens_.insert(eosTokenId_);
+        specialTokens_.insert(padTokenId_);
 
         std::cout << "[TinyCoder] Tokenizer loaded: " << vocab_.size() << " tokens, "
-                  << scores_.size() << " scores" << std::endl;
+                  << scores_.size() << " scores, "
+                  << (foundMerges ? mergeStrings.size() : 0) << " merges"
+                  << std::endl;
 
         return true;
     }
@@ -294,13 +412,11 @@ namespace tinycoder {
         buildByteToTokenId();
 
         // Set up special tokens
-        specialTokens_.insert(bosTokenId());
-        specialTokens_.insert(eosTokenId());
-        specialTokens_.insert(imStartId());
-        specialTokens_.insert(imEndId());
-        specialTokens_.insert(fimPrefixId());
-        specialTokens_.insert(fimMiddleId());
-        specialTokens_.insert(fimSuffixId());
+        specialTokens_.insert(bosTokenId_);
+        specialTokens_.insert(eosTokenId_);
+        specialTokens_.insert(padTokenId_);
+        if (imStartId_ >= 0) specialTokens_.insert(imStartId_);
+        if (imEndId_ >= 0) specialTokens_.insert(imEndId_);
 
         pretokenizeRegex_ = QWEN2_PATTERN;
 
@@ -538,19 +654,6 @@ namespace tinycoder {
         // special token IDs directly, and BPE-encode only the regular text
         // segments in between.
 
-        // Build set of special token text strings
-        static const std::vector<std::pair<std::string, int32_t>> specialTokens = {
-                {"<|endoftext|>", 151643},
-                {"<|im_start|>", 151644},
-                {"<|im_end|>", 151645},
-                {"<|fim_prefix|>", 151659},
-                {"<|fim_middle|>", 151660},
-                {"<|fim_suffix|>", 151661},
-                {"<|repo_name|>", 151662},
-                {"<|file_sep|>", 151663},
-                {"<|im_extra_id_0|>", 151664},
-        };
-
         std::vector<int32_t> result;
         size_t pos = 0;
 
@@ -560,7 +663,7 @@ namespace tinycoder {
             int32_t bestId = 0;
             size_t bestLen = 0;
 
-            for (const auto &st: specialTokens) {
+            for (const auto &st: specialTokenTexts_) {
                 size_t found = text.find(st.first, pos);
                 if (found == pos) {
                     // Special token starts at current position
