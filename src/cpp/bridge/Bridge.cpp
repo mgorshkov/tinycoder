@@ -72,8 +72,18 @@ namespace {
         tinycoder::ModelConfig config;
         if (info.Length() >= 2 && info[1].IsObject()) {
             Napi::Object jsConfig = info[1].As<Napi::Object>();
-            if (jsConfig.Has("nThreads"))
+            if (jsConfig.Has("nThreads")) {
                 config.nThreads = jsConfig.Get("nThreads").As<Napi::Number>().Uint32Value();
+                // 0 = auto: the measured-optimal logical-CPU count (llama.cpp's
+                // physical-core default regresses memory-bound generation; see
+                // plans/generation_optimizations.md §6.10). The pool is already
+                // initialized with this count in Init(), and ModelConfig keeps
+                // the resolved value for getStatus() reporting.
+                if (config.nThreads == 0) {
+                    config.nThreads = static_cast<uint32_t>(
+                            tinycoder::ThreadPool::recommendedThreadCount());
+                }
+            }
             if (jsConfig.Has("maxSeqLen"))
                 config.maxSeqLen = jsConfig.Get("maxSeqLen").As<Napi::Number>().Uint32Value();
         }
@@ -432,17 +442,22 @@ namespace {
 
 /// @brief Initialize the native addon module.
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
-    // Auto-detect CPU count and initialize the thread pool.
-    // Uses sysconf (_SC_NPROCESSORS_ONLN) on Linux to get the number of
-    // online (available) processors. This ensures all parallel loops use
-    // the full CPU count without requiring an external env variable.
-    {
-        long nCPUs = sysconf(_SC_NPROCESSORS_ONLN);
-        if (nCPUs < 1) {
-            nCPUs = 1;
-        }
-        tinycoder::ThreadPool::instance().initialize(static_cast<size_t>(nCPUs));
-    }
+    // Initialize the thread pool with the LOGICAL-CPU count
+    // (ThreadPool::recommendedThreadCount: $TINYCODER_THREADS override, else
+    // sysconf(_SC_NPROCESSORS_ONLN) on Linux — 8 on the i7-4790K reference).
+    // Measured 2026-08-28: 8 logical threads beat llama.cpp's 4-physical-core
+    // default even with the task-graph levers active (24.0 vs 21.6 tok/s on
+    // the 64-token questions), so the logical count stays the production
+    // default; physicalThreadCount() exists for A/B'ing llama.cpp's policy
+    // (see plans/generation_optimizations.md §6.5).
+    //
+    // CPU-affinity pinning follows the global TINYCODER_AFFINITY setting
+    // (CMake option default + $TINYCODER_AFFINITY env override, resolved in
+    // ThreadPool::initialize). It is NOT forced on here: callers that need a
+    // specific policy call ThreadPool::instance().setAffinityEnabled()
+    // BEFORE this init.
+    tinycoder::ThreadPool::instance().initialize(
+            tinycoder::ThreadPool::recommendedThreadCount());
 
     exports.Set("loadModel", Napi::Function::New(env, LoadModel));
     exports.Set("unloadModel", Napi::Function::New(env, UnloadModel));

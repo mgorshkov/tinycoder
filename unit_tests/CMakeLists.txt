@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.18.0)
 
 set(PROJECT_NAME tinycoder_unit_tests)
 
-project(${PROJECT_NAME} VERSION 0.2.0 DESCRIPTION "TinyCoder Unit Tests")
+project(${PROJECT_NAME} VERSION 0.3.0 DESCRIPTION "TinyCoder Unit Tests")
 
 include(FetchContent)
 
@@ -18,7 +18,7 @@ set(BUILD_GTEST ON CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(googletest)
 
-# tinycoder_common static library is built in the root CMakeLists.txt
+# tinycoder_core static library is built in the root CMakeLists.txt
 # and is available as a target in this subdirectory scope.
 
 # ---- Google Test executable ----
@@ -28,13 +28,14 @@ add_executable(tinycoder_test
     DequantizeTest.cpp
     ReferenceCompareTest.cpp
     ThreadPoolReentrancyTest.cpp
+    GPUCpuCompareTest.cpp
     SharedTestEnv.cpp
 )
 
 target_link_libraries(tinycoder_test
     PRIVATE
     gtest
-    tinycoder_common
+    tinycoder_core
 )
 
 target_include_directories(tinycoder_test

@@ -221,6 +221,17 @@ export async function generate(
 
     return addon.generate(prompt, params, callback);
 }
+/**
+ * Run a single inference request.
+ * Wrapper around {@link generate} without a token callback.
+ */
+export async function runInference(
+    prompt: string,
+    params: InferenceParams = {}
+): Promise<GenerateResult> {
+    // Reuse generate implementation; no streaming callback needed.
+    return generate(prompt, params);
+}
 
 /**
  * Stop the current generation.

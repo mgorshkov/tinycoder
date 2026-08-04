@@ -464,9 +464,7 @@ namespace tinycoder {
                         trim(tag);
                     }
                     // Strip trailing hyphen
-                    bool stripRight = false;
                     if (!tag.empty() && tag.back() == '-') {
-                        stripRight = true;
                         tag.pop_back();
                         trim(tag);
                     }
@@ -689,9 +687,7 @@ namespace tinycoder {
                         expr.erase(0, 1);
                         trim(expr);
                     }
-                    bool stripRightExpr = false;
                     if (!expr.empty() && expr.back() == '-') {
-                        stripRightExpr = true;
                         expr.pop_back();
                         trim(expr);
                     }
@@ -752,9 +748,7 @@ namespace tinycoder {
                         tag.erase(0, 1);
                         trim(tag);
                     }
-                    bool stripRight = false;
                     if (!tag.empty() && tag.back() == '-') {
-                        stripRight = true;
                         tag.pop_back();
                         trim(tag);
                     }

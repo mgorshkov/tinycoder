@@ -1,6 +1,6 @@
 # ⚡ TinyCoder AI
 
-**Ultrafast AI local coding assistant for VS Code** powered by **Qwen2.5-Coder**, **Gemma 4**, and **Qwen3.6** model families with **mixed quantization** (IQ3_XXS, IQ3_S, IQ2_S, IQ3_XS, IQ2_M, Q5_K, Q5_1, Q4_K, Q4_K_XL, Q4_K_M, Q2_K, Q6_K), **AMX/AVX-512/AVX2 CPU acceleration**, and **CUDA GPU support**. Designed to run efficiently on limited hardware.
+**Ultra-fast AI local coding agent for VS Code** powered by **Qwen2.5-Coder**, **Gemma 4**, and **Qwen3.6** model families with **mixed quantization** (IQ3_XXS, IQ3_S, IQ2_S, IQ3_XS, IQ2_M, Q5_K, Q5_1, Q4_K, Q4_K_XL, Q4_K_M, Q2_K, Q6_K), **AMX/AVX-512/AVX2 CPU acceleration**, and **CUDA GPU support**. Designed to run efficiently on limited hardware.
 
 ## Architecture
 
@@ -16,11 +16,11 @@
 │  └─────────┼──────────────────┼───────────────────┼─────────────┘ │
 │            │                  │                   │               │
 │  ┌─────────┼──────────────────┼───────────────────┼─────────────┐ │
-│  │         │    N-API Native Addon (src/cpp/Bridge.cpp)         │ │
+│  │         │    N-API Native Addon (src/cpp/bridge/Bridge.cpp)         │ │
 │  │         └──────────────────┼───────────────────┘             │ │
 │  │                            │                                 │ │
 │  │  ┌─────────────────────────┼─────────────────────────────┐  │ │
-│  │  │            C++ Inference Engine (src/cpp/)              │  │ │
+│  │  │            C++ Inference Engine (src/cpp/core/)              │  │ │
 │  │  │                                                         │  │ │
 │  │  │  ┌──────────┐  ┌──────────────┐  ┌──────────────────┐  │  │ │
 │  │  │  │  Model   │  │  GGUFLoader  │  │   Tokenizer      │  │  │ │
@@ -46,7 +46,7 @@
 │  │  │  └────────────────────────────────────────────────────┘  │  │ │
 │  │  │                                                           │  │ │
 │  │  │  ┌────────────────────────────────────────────────────┐  │  │ │
-│  │  │  │  LM Head (src/cpp/LMHead.hpp + LMHeadCUDA.cu)      │  │  │ │
+│  │  │  │  LM Head (src/cpp/core/LMHead.hpp + LMHeadCUDA.cu)      │  │  │ │
 │  │  │  │  ┌──────────────┐  ┌──────────────────────────┐   │  │  │ │
 │  │  │  │  │  CPU (OpenMP)│  │  CUDA (cublasSgemv)      │   │  │  │ │
 │  │  │  │  └──────────────┘  └──────────────────────────┘   │  │  │ │
@@ -102,10 +102,15 @@ All weights are stored in their **native quantized format** in memory and dequan
 - Per-file SIMD compilation flags (only `SIMDMatMulVec.cpp` compiled with AVX/AVX-512/AMX flags)
 
 ### 🎮 CUDA GPU Support
-- Optional GPU offload for large matrix operations via `np` library's CUDA backend
-- **CUDA-accelerated LM head** using `cublasSgemv` with persistent GPU embedding matrix
-- Automatic fallback to CPU when CUDA is unavailable or matrix is too small
-- Configurable via `ENABLE_CUDA` CMake option
+- Full-model GPU offload engine (prefill via cuBLAS fp16 tensor-core GEMM,
+  decode via quantized on-the-fly-dequant GEMV kernels, flash attention)
+- **Enabled by default** in builds compiled with `ENABLE_CUDA=ON`
+  (`./scripts/build.sh` / `npm run build:native`); all layers are offloaded
+- **Opt out** with `TINYCODER_GPU=0` (forces the CPU path);
+  `TINYCODER_NGL` limits offload to N layers; `TINYCODER_GPU_VERBOSE=1`
+  prints per-stage CUDA timings
+- Automatic fallback to CPU when CUDA is unavailable or at first-forward error
+- Configurable via `ENABLE_CUDA` CMake option (default ON in `scripts/build.sh`)
 
 ### 💻 VS Code Integration
 - **Chat panel** (standalone + sidebar) for interactive AI assistance
@@ -131,16 +136,31 @@ tinycoder/
 │   └── Tokenizer.hpp               # BPE tokenizer (Qwen2.5)
 ├── src/
 │   ├── cpp/                        # C++ source
-│   │   ├── Bridge.cpp              # N-API native addon (load, generate, status)
-│   │   ├── GGUFLoader.cpp          # GGUF v3 reader (metadata + tensor data)
-│   │   ├── GridTables.cpp          # IQ2_S grid lookup table (1024 entries)
-│   │   ├── GridTablesIQ3S.cpp      # IQ3_S grid lookup table (512 entries)
-│   │   ├── Model.cpp               # Transformer forward pass + generation loop
-│   │   ├── QuantizedEmbedding.cpp  # Quantized token embedding dequantization
-│   │   ├── QuantizedMatrix.cpp     # Quantized matrix-vector multiply (CUDA/CPU)
-│   │   ├── SIMDMatMulVec.cpp       # SIMD dispatch (AVX2/AVX-512/scalar)
-│   │   ├── LMHeadCUDA.cu           # CUDA LM head (cublasSgemv)
-│   │   └── Tokenizer.cpp           # BPE tokenizer (GGUF embedded + file loading)
+│   │   ├── core/                   # Engine core (compiled once into tinycoder_core)
+│   │   │   ├── ChatTemplateRenderer.cpp  # Chat template formatting
+│   │   │   ├── GGUFLoader.cpp            # GGUF v3 reader (metadata + tensor data)
+│   │   │   ├── GridTables.cpp            # IQ2_S grid lookup table (1024 entries)
+│   │   │   ├── GridTablesIQ3S.cpp        # IQ3_S grid lookup table (512 entries)
+│   │   │   ├── Model.cpp                 # Transformer model (forward, generate)
+│   │   │   ├── ModelDebug.cpp            # Debug helpers for the model
+│   │   │   ├── ModelForward.cpp          # Forward pass implementation
+│   │   │   ├── ModelForwardDebug.cpp     # Forward pass debug helpers
+│   │   │   ├── ModelGeneration.cpp       # Generation loop
+│   │   │   ├── ModelInternal.cpp         # Internal model helpers
+│   │   │   ├── ModelLoad.cpp             # Model loading & weight prep
+│   │   │   ├── ModelMoE.cpp              # Mixture-of-Experts layers
+│   │   │   ├── ModelPrimitives.cpp       # Core primitives
+│   │   │   ├── ModelSampling.cpp         # Token sampling
+│   │   │   ├── QuantizedEmbedding.cpp    # Quantized token embedding dequantization
+│   │   │   ├── QuantizedMatrix.cpp       # Quantized matrix-vector multiply (CUDA/CPU)
+│   │   │   ├── SIMDMatMulVec.cpp         # SIMD dispatch (AVX2/AVX-512/scalar)
+│   │   │   ├── SIMDMatMulVecAVX2.cpp     # AVX2 SIMD kernels
+│   │   │   ├── SIMDMatMulVecAVX512.cpp   # AVX-512 SIMD kernels
+│   │   │   ├── ThreadPool.cpp            # Thread pool for parallel loops
+│   │   │   ├── Tokenizer.cpp             # BPE tokenizer (GGUF embedded + file loading)
+│   │   │   └── LMHeadCUDA.cu             # CUDA LM head (cublasSgemv)
+│   │   └── bridge/                 # N-API native addon (load, generate, status)
+│   │       └── Bridge.cpp
 │   └── ts/                         # TypeScript source
 │       ├── extension.ts            # VS Code extension entry (commands, status bar)
 │       ├── panel.ts                # WebView chat panel (standalone + sidebar)
@@ -182,6 +202,15 @@ No external dependency except for linear algebra <a href="https://github.com/mgo
 
 ### Build Steps
 
+The simplest way to build everything (dependencies, TypeScript, native addon, and VSIX package)
+is the one-shot script:
+
+```bash
+./scripts/build.sh
+```
+
+For manual step-by-step builds:
+
 ```bash
 # 1. Install dependencies
 npm install
@@ -216,7 +245,7 @@ code .
 
 ### Getting a Model
 
-TinyCoder supports models from multiple families. Below are the models available in the standard model directory (`/data/models`):
+TinyCoder supports models from multiple families. Below are the list of supported models:
 
 | Model | Quantization | Size (approx) | Notes |
 |-------|-------------|---------------|-------|
@@ -233,7 +262,7 @@ TinyCoder supports models from multiple families. Below are the models available
 | `Qwen3.6 (35B-A3B)` | IQ2_M (UD) | ~8.5 GB | Ultra-compact MoE |
 | `Qwen3.6 (35B-A3B)` | IQ3_XS (Claude distill) | ~12 GB | Claude reasoning MoE |
 
-Place the `.gguf` file in the models directory and load it from the TinyCoder panel.
+Download the `.gguf` file from the internet, place it in a folder, and load it from the TinyCoder panel.
 
 ## Usage
 
@@ -316,7 +345,7 @@ IQ2_S Block (256 weights, 82 bytes):
 
 ### Fused Dequantize-Dot Product
 
-Instead of dequantizing entire matrices to F32 (which would require ~5.2 GB for the 1.5B model), [`QuantizedMatrix::matMulVec()`](src/cpp/QuantizedMatrix.cpp:83) uses a **block-level fused approach** with two strategies:
+Instead of dequantizing entire matrices to F32 (which would require ~5.2 GB for the 1.5B model), [`QuantizedMatrix::matMulVec()`](src/cpp/core/QuantizedMatrix.cpp:83) uses a **block-level fused approach** with two strategies:
 
 #### Strategy 1: Dequantize-then-Dot (legacy, for non-K-quant types)
 
@@ -387,9 +416,9 @@ The output projection matrices [`attnO`](include/Model.hpp:141) and [`ffnDown`](
 | **Native Q2_K/Q3_K** | `QuantizedMatrix` | ~1.0 MB / ~5.8 MB | Fused dot product via `matMulVec()` |
 | **Pre-dequantized FP16** | `std::vector<uint16_t>` | ~4.5 MB / ~26.2 MB | Exact float dot product via `deqMatMulVecF16()` |
 
-The FP16 copies are dequantized once during model loading ([`Model::loadWeights()`](src/cpp/Model.cpp:235)) using [`GGMLDequantize::dequantizeToF16()`](include/GGMLDequantize.hpp:1650), which dequantizes one block at a time into a small stack buffer and converts each value to FP16 inline — avoiding the large intermediate F32 allocation entirely.
+The FP16 copies are dequantized once during model loading ([`Model::loadWeights()`](src/cpp/core/Model.cpp:235)) using [`GGMLDequantize::dequantizeToF16()`](include/GGMLDequantize.hpp:1650), which dequantizes one block at a time into a small stack buffer and converts each value to FP16 inline — avoiding the large intermediate F32 allocation entirely.
 
-During the forward pass, [`deqMatMulVecF16()`](src/cpp/Model.cpp:1209) converts FP16 weights back to FP32 on-the-fly using the **F16C** instruction (`_mm256_cvtph_ps`), which converts 8 FP16 values to 8 FP32 values in a single instruction. This is available on all CPUs that support AVX2 (F16C is implied by `-mavx2` on most compilers, but GCC 13+ requires explicit `-mf16c`).
+During the forward pass, [`deqMatMulVecF16()`](src/cpp/core/Model.cpp:1209) converts FP16 weights back to FP32 on-the-fly using the **F16C** instruction (`_mm256_cvtph_ps`), which converts 8 FP16 values to 8 FP32 values in a single instruction. This is available on all CPUs that support AVX2 (F16C is implied by `-mavx2` on most compilers, but GCC 13+ requires explicit `-mf16c`).
 
 This is a deliberate trade-off: the FP16 copies consume ~30.7 MB extra memory (half of the previous F32 ~61.5 MB) while avoiding repeated dequantization of the same weights across multiple tokens. The memory bandwidth savings from FP16 (vs F32) also improve cache utilization during the forward pass.
 
@@ -412,14 +441,14 @@ Pre-packed Q2_K Block (276 bytes):
 **Target:** Only [`ffnGate`](include/Model.hpp:144) and [`ffnUp`](include/Model.hpp:145) — these account for 97.7% of Q2_K dot product calls during inference. Memory overhead: ~28.3 MB for both matrices in Qwen2.5-Coder-7B.
 
 **Implementation:**
-- Pre-packing happens at load time in [`Model::loadWeights()`](src/cpp/Model.cpp:434) via [`GGMLDequantize::prepackQ2_K()`](include/GGMLDequantize.hpp:1693)
+- Pre-packing happens at load time in [`Model::loadWeights()`](src/cpp/core/Model.cpp:434) via [`GGMLDequantize::prepackQ2_K()`](include/GGMLDequantize.hpp:1693)
 - Stored in [`QuantizedMatrix::prepackedData`](include/Model.hpp:57)
-- Runtime dispatch in [`dotProductQ2_K_PrePacked_SIMD()`](src/cpp/SIMDMatMulVec.cpp:1410) selects AVX2 or scalar kernel
+- Runtime dispatch in [`dotProductQ2_K_PrePacked_SIMD()`](src/cpp/core/SIMDMatMulVec.cpp:1410) selects AVX2 or scalar kernel
 - The pre-packed kernel is mathematically identical to the original (validated by `CompareBatchVsSequentialPrefill` test producing identical results)
 
 ### SIMD Runtime Dispatch
 
-The [`SIMDMatMulVec`](src/cpp/SIMDMatMulVec.cpp) module provides five key operations with runtime dispatch:
+The [`SIMDMatMulVec`](src/cpp/core/SIMDMatMulVec.cpp) module provides five key operations with runtime dispatch:
 
 - **`dotProductFMA()`** — Dot product of two float vectors
 - **`dotProductFMA_F16()`** — Dot product of float vector with FP16-stored weights (uses `_mm256_cvtph_ps` on AVX2)
@@ -435,7 +464,7 @@ SimdLevel level = np::internal::max_simd_level();
 // SCALAR < SSE2 < SSE3 < AVX < AVX2 < AVX512 < AMX
 ```
 
-Only [`SIMDMatMulVec.cpp`](src/cpp/SIMDMatMulVec.cpp) is compiled with SIMD ISA flags (`-mavx2 -mfma -mf16c`, `-mavx512f`, `-mamx-tile`), preventing AVX code generation in other translation units. When AMX is available, the dot product uses tile matrix operations (`_tile_dpbusd`) for 8-bit quantized data with significantly higher throughput.
+Only [`SIMDMatMulVec.cpp`](src/cpp/core/SIMDMatMulVec.cpp) is compiled with SIMD ISA flags (`-mavx2 -mfma -mf16c`, `-mavx512f`, `-mamx-tile`), preventing AVX code generation in other translation units. When AMX is available, the dot product uses tile matrix operations (`_tile_dpbusd`) for 8-bit quantized data with significantly higher throughput.
 
 ### GGUF Format Support
 
@@ -452,12 +481,69 @@ The KV cache stores key and value tensors as F32 arrays with shape `[numLayers, 
 
 The cache position is tracked and incremented during generation. [`clearKVCache()`](include/Model.hpp:115) resets the position and reallocates the cache arrays.
 
+### Prefill vs. Generation
+
+Like most decoder-only transformers, TinyCoder's inference is split into **two distinct phases** that the [`Model::generate()`](src/cpp/core/Model.cpp:4783) entry point orchestrates. Both phases drive the same core forward pass, [`Model::forward()`](src/cpp/core/Model.cpp:2355), but with different `seqLen`, different parallelization strategies, and different LM-head behavior. The KV cache carries state across both phases.
+
+#### 1. Prefill — processing the whole prompt at once
+
+```
+generate(prompt)
+  ├─ tokens = tokenize(prompt)              # prompt → token IDs
+  ├─ forward(tokens, computeAllLogits=false) # batch-process ALL prompt tokens at once
+  ├─ lastLogits = logits[last token]         # only the final token matters for sampling
+  └─ nextToken = sampleToken(lastLogits)     # sample the first generated token
+```
+
+Prefill processes **every prompt token simultaneously** in a batched forward pass (`seqLen = number of prompt tokens`). Its job is to compute the hidden state for the *last* prompt token and to populate the KV cache with the keys/values for every prompt position so that later decode steps can attend to them.
+
+Key characteristics of the prefill phase:
+
+- **Batched GEMM instead of per-token GEMV.** Because all tokens share the same weight matrices, [`forward()`](src/cpp/core/Model.cpp:2355) switches the linear-layer kernels from a per-token matrix-vector product to a batched matrix-vector product (e.g. `matMulVecBatchQuantized`, `matMulVecFusedGateUp_Batch`, `matMulVecBatchQ2_K_PrePacked_Q8_Batch_SIMD`). This parallelizes over output rows and reuses each weight row across all tokens, so the weight matrix is read **once instead of `seqLen` times** — the dominant cost of prefill is DRAM bandwidth on the weight matrix.
+- **Parallel over tokens.** For `seqLen > 1`, the token loop is dispatched through `ThreadPool::instance().parallelFor`, and Q/K/V projections plus FFN matmuls use the batched kernels.
+- **Causal masking in attention.** The batched [`attentionFused()`](src/cpp/core/Model.cpp:858) computes attention scores for all `seqLen` queries at once, enforcing causality: each query token may only attend to cache positions up to its own position (`csEnd = cachePos + s`). Positions beyond that are masked to `-infinity` before softmax so future tokens never leak into earlier hidden states.
+- **KV cache write.** After RoPE, each token's K and V are copied into the cache layer buffer at offset `cachePos + s`.
+- **LM head only for the last token.** [`generate()`](src/cpp/core/Model.cpp:4783) calls `forward(tokens, /*computeAllLogits=*/false)`. The LM head reads the full `vocabSize × hiddenSize` embedding matrix per token, so `forward()` limits logits computation to only the last row (`logitStart = seqLen − 1`, `logitCount = 1`), avoiding `seqLen` re-reads of that very large matrix. The cached K/V for all prompt positions is retained for the decode phase.
+
+#### 2. Generation — autoregressive decode, one token at a time
+
+```
+for i in 1..maxTokens:
+  newLogits = forward({nextToken})   # decode step: token-by-token, seqLen = 1
+  lastLogits = newLogits[0]
+  apply repetition penalty            # optionally down-weight recently seen tokens
+  nextToken = sampleToken(lastLogits) # temperature / top-K / top-P sampling
+  if isEogToken(nextToken): break     # end-of-generation token
+  push nextToken; callback(tokenText) # stream token to the UI
+```
+
+After prefill, generation enters an **autoregressive loop** in [`generate()`](src/cpp/core/Model.cpp:4783). Each iteration decodes exactly **one new token**:
+
+- **Single-token forward pass.** Each step calls `forward({nextToken})` with `seqLen = 1`. Only the newly generated token feeds through the network; the 2048-token prompt is *not* reprocessed.
+- **KV cache reuse.** The new K/V from the current step is appended to the cache. In attention, the single query attends to the full cached history (`cacheLen = cachePos + 1`) accumulated since prefill — so the per-token work is roughly constant, not growing quadratically with context.
+- **Fast path.** When `seqLen == 1`, `forward()` runs the per-token work directly on the calling thread, bypassing ThreadPool dispatch overhead, and uses the per-token fused GEMV kernels (`matMulVecFusedQKV`, `matMulVecFusedGateUp`, `deqMatMulVecF16`) rather than the batched GEMM paths. Intermediate buffers come from a per-thread `ScratchPool` that is retained between calls, so steady-state generation performs **zero heap allocations per token**.
+- **LM head for every step.** Unlike prefill, each decode step computes the full vocabulary logits (all `vocabSize` rows) because sampling needs a full probability distribution. On CPU this uses the pre-dequantized Q2_K embeddings to cut DRAM traffic; on CUDA it calls `cuda::computeLMHead` against the persistently-uploaded embedding matrix.
+
+Because prefill fills the KV cache once, decode steps stay cheap and memory-bound; generation speed is dominated by the LM head (the largest single memory read per token) and the per-layer attention/FFN matmuls.
+
+#### Sampling
+
+Both phases converge on the same sampler. [`applySamplingParams()`](src/cpp/core/Model.cpp:4591) converts raw logits to a probability distribution, and [`sampleToken()`](src/cpp/core/Model.cpp:4702) draws a token from it using a persistent `std::mt19937`:
+
+1. **Temperature** — scale logits by `1 / temperature`.
+2. **Softmax** — convert scaled logits to probabilities.
+3. **Top-K** — keep only the `topK` highest-probability tokens, zeroing the rest and renormalizing.
+4. **Top-P (nucleus)** — keep the smallest set of tokens whose cumulative probability reaches `topP`, then renormalize.
+5. **Sampling** — draw a random `r ∈ [0,1)` and walk the cumulative distribution; the token whose interval contains `r` is returned.
+
+Repetition penalty is applied *before* sampling in [`generate()`](src/cpp/core/Model.cpp:4844): logits of tokens among the last `repeatLastN` generated tokens are scaled down (negative ⇒ multiplied, positive ⇒ divided) by `repeatPenalty` to discourage loops. Generation stops when an end-of-generation token such as `<|endoftext|>` is sampled or `maxTokens` is reached.
+
 ### LM Head Optimization
 
 The LM head computation (logits = hidden × embeddings^T) is the most expensive operation for large vocabularies (151k+ tokens). Two optimized paths:
 
 1. **CPU path** ([`LMHead::computeCPU()`](include/LMHead.hpp:64)): OpenMP-parallelized loop over vocabulary, dequantizing one embedding block at a time with SIMD dot products
-2. **CUDA path** ([`LMHeadCUDA.cu`](src/cpp/LMHeadCUDA.cu)): Dequantizes the full embedding matrix once, uploads to GPU persistently, and uses `cublasSgemv` for each token position
+2. **CUDA path** ([`LMHeadCUDA.cu`](src/cpp/core/LMHeadCUDA.cu)): Dequantizes the full embedding matrix once, uploads to GPU persistently, and uses `cublasSgemv` for each token position
 
 Weight tying is detected automatically: if `output.weight` and `token_embd.weight` point to the same data, the LM head reuses the embedding matrix.
 

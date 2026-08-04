@@ -36,55 +36,6 @@ SOFTWARE.
 
 namespace tinycoder {
 
-    /// @brief Compute y = x * W where W is (rows x cols) = (out_features x
-    /// in_features), stored row-major in GGUF format.
-    ///        x has size cols (in_features), result has size rows (out_features).
-    ///
-    ///        GGUF stores weight matrices as (out_features x in_features)
-    ///        in row-major order, so W[j][i] = data[j * cols + i] where j indexes
-    ///        output features and i indexes input features.
-    ///        The computation is: y_j = sum_i x[i] * W[j][i] = sum_i x[i] * data[j * cols + i]
-    static np::Array<float> matMulVecCUDA(const float *x, const float *W,
-                                          uint32_t rows, uint32_t cols) {
-#ifdef USE_CUDA
-        // Only use CUDA for matrices large enough to justify GPU overhead
-        constexpr uint64_t CUDA_MIN_ELEMENTS = 256 * 256;// ~256KB
-
-        uint64_t numElements = static_cast<uint64_t>(rows) * cols;
-        if (numElements >= CUDA_MIN_ELEMENTS) {
-            try {
-                np::Array<float> result(np::Shape{rows});
-                float *resultData = result.data();
-
-                // Use np library's CUDA-accelerated dot1d2d
-                // dot1d2d computes y_j = sum_i x_i * W[j][i] (y = x * W^T)
-                // where W is (rows x cols). Our matrix is stored as
-                // (rows x cols) = (out_features x in_features) in GGUF row-major.
-                np::internal::cuda::dot1d2d(x, W, rows, cols, resultData);
-
-                return result;
-            } catch (const std::exception &e) {
-                // CUDA failed (no GPU, no driver, OOM, etc.) — fall back to CPU
-                std::fprintf(stderr, "CUDA dot1d2d failed, falling back to CPU: %s\n",
-                             e.what());
-            }
-        }
-#endif
-        // Fallback to CPU: compute y = x * W
-        // W is stored as (rows x cols) row-major: W[j][i] = data[j * cols + i]
-        // y_j = sum_i x[i] * W[j][i] for j in [0, rows), i in [0, cols)
-        np::Array<float> result(np::Shape{rows});
-        float *resultData = result.data();
-        for (uint32_t j = 0; j < rows; ++j) {
-            double dot = 0.0;
-            for (uint32_t i = 0; i < cols; ++i) {
-                dot += static_cast<double>(x[i]) * W[static_cast<size_t>(j) * cols + i];
-            }
-            resultData[j] = static_cast<float>(dot);
-        }
-        return result;
-    }
-
     np::Array<float> QuantizedMatrix::matMulVec(const float *x) const {
         // Allocate result and delegate to the out-parameter version
         np::Array<float> result(np::Shape{rows});
@@ -138,7 +89,10 @@ namespace tinycoder {
         // pre-packed at load time. The pre-packed format eliminates the 2-bit
         // extraction overhead in the SIMD kernel.
         if (type == GGML_TYPE_Q2_K && !prepackedData.empty()) {
-            GGMLDequantize::matMulVecFusedQ2_K_PrePacked(prepackedData.data(), x, rows, cols, out);
+            // quantize x to Q8_K (int8) once per matmul,
+            // then use _mm256_maddubs_epi16 (32 int8×int8->int16 multiply-adds
+            // per instruction) instead of float FMAs (8 per instruction).
+            GGMLDequantize::matMulVecFusedQ2_K_PrePacked_Q8(prepackedData.data(), x, rows, cols, out);
             return;
         }
 
@@ -157,6 +111,48 @@ namespace tinycoder {
         np::Array<float> result(np::Shape{numRows});
         matMulVecRows(x, rowStart, numRows, result.data());
         return result;
+    }
+
+    void QuantizedMatrix::matMulVecFusedGateUp(const QuantizedMatrix &other,
+                                               const float *x, float *gateOut,
+                                               float *upOut,
+                                               bool applySwish) const {
+        // Compute gate = x * this^T and up = x * other^T in a single pass over x.
+        // Both matrices must share the same dimensions and quantized type.
+        if (rows != other.rows || cols != other.cols || type != other.type) {
+            // Fallback: two separate matmuls
+            matMulVec(x, gateOut);
+            other.matMulVec(x, upOut);
+            return;
+        }
+
+        // Fast path: fused Q2_K gate+up kernel over the COMPACT (raw) blocks.
+        // This fn is used for single-token generation, which is
+        // DRAM-bandwidth-bound; the compact 84-byte Q2_K blocks (vs 276-byte
+        // prepacked) cut the gate+up weight traffic ~3.3x — the dominant
+        // per-token cost — matching llama.cpp's working set. The kernel unpacks
+        // the 2-bit quants on the fly (verified index-identical to the prepacked
+        // expansion) and computes both dot products per row, quantizing x to
+        // Q8_K once.
+        if (type == GGML_TYPE_Q2_K && !data.empty() && !other.data.empty()) {
+            GGMLDequantize::matMulVecFusedGateUpQ2_K_Compact_Q8(
+                    data.data(), other.data.data(), x, rows, cols,
+                    gateOut, upOut, applySwish);
+            return;
+        }
+
+        // Fallback fast path: pre-packed Q2_K gate+up fused kernel (same maths,
+        // 3.3x larger weight read — used when the compact data is unavailable).
+        if (type == GGML_TYPE_Q2_K && !prepackedData.empty() && !other.prepackedData.empty()) {
+            GGMLDequantize::matMulVecFusedGateUpQ2_K_PrePacked_Q8(
+                    prepackedData.data(), other.prepackedData.data(), x, rows, cols,
+                    gateOut, upOut);
+            return;
+        }
+
+        // General fallback: two separate matmuls
+        matMulVec(x, gateOut);
+        other.matMulVec(x, upOut);
     }
 
     void QuantizedMatrix::matMulVecRows(const float *x, uint32_t rowStart, uint32_t numRows, float *out) const {

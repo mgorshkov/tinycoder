@@ -33,14 +33,17 @@ SOFTWARE.
  * verifies that dequantization produces the expected float values.
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <random>
 #include <regex>
 #include <vector>
 
 #include "GGMLDequantize.hpp"
 #include "GGUFLoader.hpp"
+#include "SIMDMatMulVec.hpp"
 
 using namespace tinycoder;
 
@@ -581,4 +584,248 @@ TEST(DequantizeTest, Q2_K_PrePackedVsOriginal) {
     // The two kernels should match each other
     EXPECT_NEAR(originalResult, prepackedResult, 1e-4f)
             << "Original and pre-packed kernels produce different results";
+}
+
+// ---------------------------------------------------------------------------
+// Test: Q8_K dot product kernel vs reference
+// ---------------------------------------------------------------------------
+// Validates that the Q8_K-quantized dot product kernel (which uses
+// _mm256_maddubs_epi16) produces results matching the reference
+// dequantize-then-dot computation within Q8_K quantization tolerance.
+TEST(DequantizeTest, Q2_K_Q8KernelVsReference) {
+    // Create a synthetic Q2_K block (84 bytes)
+    uint8_t blockData[84] = {};
+
+    // Set d = 2.0 (fp16: 0x4000)
+    blockData[80] = 0x00;
+    blockData[81] = 0x40;
+
+    // Set dmin = 0.5 (fp16: 0x3800)
+    blockData[82] = 0x00;
+    blockData[83] = 0x38;
+
+    // Set scales[16]: each byte has 4-bit scale (low) and 4-bit min (high)
+    for (int i = 0; i < 16; ++i) {
+        blockData[i] = static_cast<uint8_t>((i << 4) | (15 - i));
+    }
+
+    // Set qs[64]: pack 2-bit values (0, 1, 2, 3) into each byte
+    for (int i = 0; i < 64; ++i) {
+        uint8_t byteVal = 0;
+        for (int b = 0; b < 4; ++b) {
+            uint8_t val = static_cast<uint8_t>((i * 4 + b) % 4);
+            byteVal |= (val << (b * 2));
+        }
+        blockData[16 + i] = byteVal;
+    }
+
+    // Pre-pack the block
+    auto prepacked = GGMLDequantize::prepackQ2_K(blockData, 256);
+    ASSERT_EQ(prepacked.size(), 276u);
+
+    // Create a random x vector of 256 floats
+    float x[256];
+    std::srand(42);
+    for (int i = 0; i < 256; ++i) {
+        x[i] = static_cast<float>(std::rand()) / RAND_MAX * 2.0f - 1.0f;
+    }
+
+    // Quantize x to Q8_K
+    Q8KBlock q8;
+    GGMLDequantize::quantizeQ8K(x, 256, &q8);
+
+    // Compute dot product using the Q8_K kernel
+    float q8Result = dotProductQ2_K_PrePacked_Q8_SIMD(prepacked.data(), &q8);
+
+    // Reference: dequantize then dot
+    float deqRef[256];
+    GGMLDequantize::dequantizeQ2_KBlock(blockData, deqRef);
+    double refDot = 0.0;
+    for (int i = 0; i < 256; ++i) {
+        refDot += static_cast<double>(x[i]) * deqRef[i];
+    }
+    float referenceResult = static_cast<float>(refDot);
+
+    std::cout << "  Q8_K kernel:   " << q8Result << std::endl;
+    std::cout << "  Reference:     " << referenceResult << std::endl;
+
+    // Q8_K quantization introduces ~1/127 relative error per element, so use a
+    // relative tolerance rather than an absolute one. The reference magnitude is
+    // ~350 here, so 1e-2 absolute would be far too tight.
+    const float relTol = 0.01f * std::max(1.0f, std::fabs(referenceResult));
+    EXPECT_NEAR(q8Result, referenceResult, relTol)
+            << "Q8_K kernel differs from reference dequantize-then-dot";
+}
+
+// ---------------------------------------------------------------------------
+// Test: quantizeQ2KRow round-trip (Lever C load-time quantizer).
+// Quantizes a float row to compact Q2_K, dequantizes with dequantizeQ2_KBlock,
+// and checks the mean abs error is small (Q2_K is inherently lossy ~1/3 scale).
+// This localizes quantizer bugs (layout/scale) vs kernel bugs.
+// ---------------------------------------------------------------------------
+TEST(DequantizeTest, QuantizeQ2KRowRoundtrip) {
+    constexpr uint32_t N = 256;
+    float x[N];
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+    for (uint32_t i = 0; i < N; ++i) x[i] = dist(rng);
+
+    uint8_t q2k[84];
+    GGMLDequantize::quantizeQ2KRow(x, N, q2k);
+    float deq[N];
+    GGMLDequantize::dequantizeQ2_KBlock(q2k, deq);
+
+    double sumErr = 0.0, sumAbs = 0.0;
+    for (uint32_t i = 0; i < N; ++i) {
+        sumErr += std::fabs(deq[i] - x[i]);
+        sumAbs += std::fabs(x[i]);
+    }
+    double meanErr = sumErr / N;
+    double meanAbs = sumAbs / N;
+    std::cout << "  meanErr=" << meanErr << " meanAbs=" << meanAbs
+              << " rel=" << (meanAbs > 0 ? meanErr / meanAbs : 0.0) << std::endl;
+    // Q2_K is a ~2-bit codebook: worst-case per-element error is ~1/3 of the
+    // group range, so ~35% mean relative error is inherent (the +ml bug above
+    // showed ~140%, a layout/scale corruption — well beyond this bound).
+    EXPECT_LT(meanErr, 0.5 * meanAbs + 1e-6)
+            << "Q2_K round-trip error too large: quantizer layout/scale bug";
+}
+
+// ---------------------------------------------------------------------------
+// Test: fused gate+up+down Q2K variant vs scalar reference (Lever C kernel).
+// Validates matMulVecFusedGateUpDownQ2K_Q2K_SIMD against a scalar reference
+// (dequantize-then-dot), localizing bugs in the new Q2_K ffnDown phase.
+// ---------------------------------------------------------------------------
+TEST(DequantizeTest, FusedGateUpDownQ2KDownVsReference) {
+    constexpr uint32_t BLOCK = 256;
+    constexpr uint32_t ROWS = 256;
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<float> dist(-0.03f, 0.03f);
+
+    // x (hidden), gate/up/down rows: 256 x 256 (single block per row).
+    // Matrix layout is row-major [rows][blocksPerRow], so a rows x cols matrix
+    // needs rows*ceil(cols/256) blocks (the kernel reads per-row stride).
+    std::vector<float> x(BLOCK);
+    std::vector<std::vector<float>> gateF(ROWS, std::vector<float>(BLOCK));
+    std::vector<std::vector<float>> upF(ROWS, std::vector<float>(BLOCK));
+    std::vector<std::vector<float>> downF(ROWS, std::vector<float>(BLOCK));
+    for (uint32_t i = 0; i < BLOCK; ++i) x[i] = dist(rng);
+    for (uint32_t r = 0; r < ROWS; ++r)
+        for (uint32_t j = 0; j < BLOCK; ++j) {
+            gateF[r][j] = dist(rng);
+            upF[r][j] = dist(rng);
+            downF[r][j] = dist(rng);
+        }
+
+    std::vector<uint8_t> gateQ(ROWS * 84), upQ(ROWS * 84), downQ(ROWS * 84);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        GGMLDequantize::quantizeQ2KRow(gateF[r].data(), BLOCK, gateQ.data() + r * 84);
+        GGMLDequantize::quantizeQ2KRow(upF[r].data(), BLOCK, upQ.data() + r * 84);
+        GGMLDequantize::quantizeQ2KRow(downF[r].data(), BLOCK, downQ.data() + r * 84);
+    }
+
+    std::vector<float> out(BLOCK, 0.0f), residual(BLOCK, 0.01f), ref(BLOCK);
+    bool used = matMulVecFusedGateUpDownQ2K_Q2K_SIMD(
+            gateQ.data(), upQ.data(), downQ.data(), x.data(),
+            BLOCK, BLOCK, BLOCK, out.data(), residual.data());
+    ASSERT_TRUE(used) << "AVX2 fused Q2K kernel not dispatched";
+
+    // Scalar reference: dequantize the full ROWS x BLOCK matrices, then
+    // act[j] = silu(sum_k x[k]*gate[j,k]) * sum_k x[k]*up[j,k], and
+    // ref[i] = sum_j act[j]*down[i,j] + residual[i].
+    std::vector<float> gateDeq(ROWS * BLOCK), upDeq(ROWS * BLOCK);
+    std::vector<float> downDeq(ROWS * BLOCK);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        GGMLDequantize::dequantizeQ2_KBlock(gateQ.data() + r * 84,
+                                            gateDeq.data() + r * BLOCK);
+        GGMLDequantize::dequantizeQ2_KBlock(upQ.data() + r * 84,
+                                            upDeq.data() + r * BLOCK);
+        GGMLDequantize::dequantizeQ2_KBlock(downQ.data() + r * 84,
+                                            downDeq.data() + r * BLOCK);
+    }
+    std::vector<float> act(BLOCK);
+    for (uint32_t j = 0; j < BLOCK; ++j) {
+        double g = 0.0, u = 0.0;
+        for (uint32_t k = 0; k < BLOCK; ++k) {
+            g += static_cast<double>(x[k]) * gateDeq[j * BLOCK + k];
+            u += static_cast<double>(x[k]) * upDeq[j * BLOCK + k];
+        }
+        float gv = static_cast<float>(g);
+        act[j] = gv / (1.0f + std::exp(-gv)) * static_cast<float>(u);
+    }
+    for (uint32_t i = 0; i < BLOCK; ++i) {
+        double d = 0.0;
+        for (uint32_t k = 0; k < BLOCK; ++k) {
+            d += static_cast<double>(act[k]) * downDeq[i * BLOCK + k];
+        }
+        ref[i] = static_cast<float>(d) + residual[i];
+    }
+
+    double maxAbs = 0.0, maxRef = 0.0;
+    for (uint32_t i = 0; i < BLOCK; ++i) {
+        maxAbs = std::max(maxAbs, static_cast<double>(std::fabs(out[i] - ref[i])));
+        maxRef = std::max(maxRef, static_cast<double>(std::fabs(ref[i])));
+    }
+    std::cout << "  maxAbsDiff=" << maxAbs << " maxRef=" << maxRef << std::endl;
+    const double tol = 0.05 * std::max(1.0, maxRef) + 1e-3;
+    EXPECT_LT(maxAbs, tol)
+            << "Fused Q2K-down kernel deviates from scalar reference";
+}
+
+// ---------------------------------------------------------------------------
+// Test: matMulVecBatchQ2K_Compact_SIMD vs the per-block scalar Q2_K dot path.
+// Exercises the LM-head compact Q2_K batch kernel (Lever C) over multiple
+// vocab rows and tokens (seqLen=2 to cover the [row][token] accumulator
+// indexing); every output is compared against the dequantize-then-dot
+// reference the non-AVX2 fallback uses.
+// ---------------------------------------------------------------------------
+TEST(DequantizeTest, BatchQ2KCompactVsScalarDot) {
+    constexpr uint32_t BLOCK = 256;
+    constexpr uint32_t ROWS = 24;
+    constexpr uint32_t SEQ = 2;
+    std::mt19937 rng(23);
+    std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+
+    // Quantize each row of an ROWS x BLOCK matrix to compact Q2_K.
+    std::vector<std::vector<float>> wF(ROWS, std::vector<float>(BLOCK));
+    std::vector<uint8_t> wQ(ROWS * 84);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        for (uint32_t j = 0; j < BLOCK; ++j) wF[r][j] = dist(rng);
+        GGMLDequantize::quantizeQ2KRow(wF[r].data(), BLOCK, wQ.data() + r * 84);
+    }
+    std::vector<float> wDeq(ROWS * BLOCK);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        GGMLDequantize::dequantizeQ2_KBlock(wQ.data() + r * 84,
+                                            wDeq.data() + r * BLOCK);
+    }
+
+    // Two token vectors; out is [seqLen][rows] row-major (LM-head convention).
+    std::vector<float> x(SEQ * BLOCK);
+    for (uint32_t s = 0; s < SEQ; ++s)
+        for (uint32_t j = 0; j < BLOCK; ++j) x[s * BLOCK + j] = dist(rng);
+    std::vector<float> out(SEQ * ROWS, 0.0f);
+
+    bool used = matMulVecBatchQ2K_Compact_SIMD(wQ.data(), x.data(), SEQ, ROWS,
+                                               BLOCK, out.data());
+    ASSERT_TRUE(used) << "AVX2 compact Q2_K batch kernel not dispatched";
+
+    // Reference: direct float dot against the dequantized matrix.
+    double maxAbs = 0.0, maxRef = 0.0;
+    for (uint32_t s = 0; s < SEQ; ++s) {
+        for (uint32_t r = 0; r < ROWS; ++r) {
+            double d = 0.0;
+            for (uint32_t j = 0; j < BLOCK; ++j) {
+                d += static_cast<double>(x[s * BLOCK + j]) * wDeq[r * BLOCK + j];
+            }
+            float ref = static_cast<float>(d);
+            maxAbs = std::max(maxAbs, static_cast<double>(std::fabs(out[s * ROWS + r] - ref)));
+            maxRef = std::max(maxRef, static_cast<double>(std::fabs(ref)));
+        }
+    }
+    std::cout << "  maxAbsDiff=" << maxAbs << " maxRef=" << maxRef << std::endl;
+    // Q8_K quant of x contributes ~1/127 relative error; the reference above is
+    // exact-float so the tolerance must absorb it.
+    const double tol = 0.01 * std::max(1.0, maxRef) + 1e-3;
+    EXPECT_LT(maxAbs, tol)
+            << "Compact Q2_K batch kernel deviates from scalar dot reference";
 }

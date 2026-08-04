@@ -10,6 +10,7 @@ out/
 
 # C++ build
 build/
+build-*/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
