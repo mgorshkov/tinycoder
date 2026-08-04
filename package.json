@@ -2,7 +2,7 @@
   "name": "tinycoder",
   "displayName": "TinyCoder AI",
   "description": "Local AI coding assistant powered by Qwen2.5-Coder, Gemma 4, and Qwen3.6 GGUF models. Native C++ inference with AVX2/AVX-512/AMX SIMD acceleration and CUDA GPU support. Runs entirely offline on limited resources.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "tinycoder",
   "license": "MIT",
   "repository": {
@@ -52,7 +52,8 @@
     "onCommand:tinycoder.completeCode",
     "onCommand:tinycoder.generateCode",
     "onCommand:tinycoder.loadModel",
-    "onCommand:tinycoder.showStatus"
+    "onCommand:tinycoder.showStatus",
+    "onCommand:tinycoder.inferFromTerminal"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -98,6 +99,10 @@
       {
         "command": "tinycoder.showStatus",
         "title": "TinyCoder: Show Status"
+      },
+      {
+        "command": "tinycoder.inferFromTerminal",
+        "title": "TinyCoder: Infer from Terminal Selection"
       }
     ],
     "keybindings": [
@@ -127,10 +132,10 @@
         },
         "tinycoder.nThreads": {
           "type": "number",
-          "default": 4,
-          "minimum": 1,
+          "default": 0,
+          "minimum": 0,
           "maximum": 64,
-          "description": "Number of CPU threads for inference"
+          "description": "Number of CPU threads for inference (0 = auto: logical CPU count, the measured optimum; physical-core count regresses on memory-bound generation)"
         },
         "tinycoder.maxSeqLen": {
           "type": "number",
@@ -188,7 +193,8 @@
     "vscode:prepublish": "npm run compile && npm run build:native",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "build:native": "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release",
+    "build:native": "cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON && cmake --build build --config Release",
+    "build:native:cpu": "cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=OFF && cmake --build build --config Release",
     "build:native:avx2": "cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_AVX512=OFF -DENABLE_AMX=OFF && cmake --build build --config Release",
     "build:native:cuda": "cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON && cmake --build build --config Release",
     "lint": "eslint src --ext ts",

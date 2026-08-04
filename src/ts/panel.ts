@@ -292,8 +292,11 @@ export class TinyCoderPanel {
             stage: 'Starting...'
         });
 
+        // nThreads 0 = auto: the bridge maps it to ThreadPool::recommendedThreadCount()
+        // (logical CPU count, measured optimum). A physical-core default regresses
+        // memory-bound generation (see plans/generation_optimizations.md §6.10).
         const result = await loadModel(modelPath, {
-            nThreads: vscode.workspace.getConfiguration('tinycoder').get('nThreads', 4),
+            nThreads: vscode.workspace.getConfiguration('tinycoder').get('nThreads', 0),
             maxSeqLen: vscode.workspace.getConfiguration('tinycoder').get('maxSeqLen', 2048)
         }, (progress: number, stage: string) => {
             this.sendMessage({

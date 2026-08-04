@@ -25,7 +25,7 @@ SOFTWARE.
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { TinyCoderPanel } from './panel';
-import { getStatus, isModelLoaded } from './nativeBridge';
+import { getStatus, isModelLoaded, generate } from './nativeBridge';
 
 let panel: TinyCoderPanel | undefined;
 
@@ -199,6 +199,40 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    // Register terminal command to infer from selected text
+    const inferFromTerminalCommand = vscode.commands.registerCommand('tinycoder.inferFromTerminal', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showInformationMessage('No active editor');
+            return;
+        }
+        const selection = editor.selection;
+        const selectedText = editor.document.getText(selection);
+        if (!selectedText) {
+            vscode.window.showInformationMessage('No text selected');
+            return;
+        }
+        try {
+            const config = vscode.workspace.getConfiguration('tinycoder');
+            const params = {
+                maxTokens: config.get<number>('maxTokens'),
+                temperature: config.get<number>('temperature'),
+                topP: config.get<number>('topP'),
+                repeatPenalty: config.get<number>('repeatPenalty')
+            };
+            const result = await generate(selectedText, params);
+            // Use the active terminal or create a new one
+            let terminal = vscode.window.activeTerminal;
+            if (!terminal) {
+                terminal = vscode.window.createTerminal('TinyCoder');
+            }
+            terminal.show();
+            terminal.sendText(result.text);
+        } catch (err: any) {
+            vscode.window.showErrorMessage(`TinyCoder inference error: ${err.message}`);
+        }
+    });
+
     // Register command to show model status
     const statusCommand = vscode.commands.registerCommand('tinycoder.showStatus', () => {
         const status = getStatus();
@@ -218,7 +252,8 @@ export function activate(context: vscode.ExtensionContext) {
         completeCommand,
         generateCommand,
         loadModelCommand,
-        statusCommand
+        statusCommand,
+        inferFromTerminalCommand
     );
 
     // Add status bar item

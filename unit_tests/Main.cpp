@@ -45,14 +45,13 @@ SOFTWARE.
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
 
-    // Initialize the thread pool with the number of available CPUs
-    {
-        long nCPUs = sysconf(_SC_NPROCESSORS_ONLN);
-        if (nCPUs < 1) {
-            nCPUs = 1;
-        }
-        tinycoder::ThreadPool::instance().initialize(static_cast<size_t>(nCPUs));
-    }
+    // Initialize the thread pool with the LOGICAL-CPU count
+    // (ThreadPool::recommendedThreadCount: $TINYCODER_THREADS override, else
+    // sysconf(_SC_NPROCESSORS_ONLN) on Linux). Measured optimum on the
+    // reference host is the logical count (8); oversubscribing beyond it
+    // regresses ~6x — see plans/generation_optimizations.md Appendix B.
+    tinycoder::ThreadPool::instance().initialize(
+            tinycoder::ThreadPool::recommendedThreadCount());
 
     // Read model path from environment variable
     const char *envPath = std::getenv("TINYCODER_MODEL_PATH");

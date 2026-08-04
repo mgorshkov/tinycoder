@@ -23,6 +23,7 @@ SOFTWARE.
 */
 
 #include "GGUFLoader.hpp"
+#include "MemHints.hpp"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -607,6 +608,16 @@ namespace tinycoder {
 
         tensorData_.resize(totalSize);
         file_.read(reinterpret_cast<char *>(tensorData_.data()), totalSize);
+        // Hint the kernel to back this (potentially multi-hundred-MB) tensorbase
+        // with 2 MB pages — collapses the dTLB working set of the per-token
+        // weight streaming (see plans/generation_optimizations.md §6.10,
+        // measured 4.65x dTLB misses vs llama.cpp at 4 t). NOTE: must come
+        // AFTER the backing read fills the buffer: hinting unfaulted zero pages
+        // makes every first fault on this host's `defrag=madvise` try
+        // synchronous compaction, and feeding khugepaged a ~750 MB zero range
+        // to collapse during inference steals CPU from the worker threads
+        // (measured as the ~5% generation regression; see §6.10.2).
+        tinycoder::adviseHugePages(tensorData_.data(), totalSize);
 
         if (!file_) {
             std::cerr << "[TinyCoder] Failed to read tensor data: expected "

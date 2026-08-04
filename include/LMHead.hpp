@@ -69,6 +69,73 @@ namespace tinycoder {
             });
         }
 
+        /// @brief Compute LM head logits on CPU using FP16-stored embeddings.
+        ///
+        /// Same as computeCPU() but reads the embedding matrix from FP16 storage,
+        /// halving memory bandwidth. The source embeddings are Q2_K (~2-bit), so
+        /// FP16 is lossless. Uses F16C _mm256_cvtph_ps for on-the-fly conversion.
+        ///
+        /// @param hidden      Input hidden state vector (size hiddenSize)
+        /// @param embedData   Pre-dequantized embedding matrix in FP16 (vocabSize × hiddenSize, row-major)
+        /// @param vocabSize   Number of vocabulary entries
+        /// @param hiddenSize  Hidden dimension size
+        /// @param logits      Output logits vector (size vocabSize, pre-allocated)
+        static void computeCPUF16(const float *hidden, const uint16_t *embedData,
+                                  uint32_t vocabSize, uint32_t hiddenSize, float *logits) {
+            ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                const uint16_t *embRow = embedData + static_cast<uint64_t>(i) * hiddenSize;
+                logits[i] = dotProductFMA_F16(hidden, embRow, hiddenSize);
+            });
+        }
+
+        /// @brief Compute LM head logits on CPU using Q8_K-stored embeddings.
+        ///
+        /// Same as computeCPU() but reads the embedding matrix from Q8_K storage
+        /// (256 int8 values + a block scale per block), cutting memory bandwidth
+        /// ~2× vs FP16 and ~4× vs F32. The dot product uses _mm256_maddubs_epi16
+        /// int8 kernels. Since the source embeddings are Q2_K (~2-bit), Q8_K is
+        /// lossless.
+        ///
+        /// @param hidden      Input hidden state vector (size hiddenSize)
+        /// @param embedData   Pre-quantized embedding matrix in Q8_K (vocabSize × blocksPerRow, row-major)
+        /// @param vocabSize   Number of vocabulary entries
+        /// @param hiddenSize  Hidden dimension size
+        /// @param logits      Output logits vector (size vocabSize, pre-allocated)
+        static void computeCPUQ8K(const float *hidden, const Q8KBlock *embedData,
+                                  uint32_t vocabSize, uint32_t hiddenSize, float *logits) {
+            uint32_t blocksPerRow = (hiddenSize + 255) / 256;
+
+            // Quantize the hidden vector to Q8_K once per token (reused across all
+            // vocab rows). This is the key win: the original FP16/F32 paths read the
+            // full hidden vector from RAM for every vocab row.
+            // P7: reusable grow-only scratch (shared buffer, written by the calling
+            // thread before parallelFor, only read by workers) so steady-state
+            // generation performs no heap allocation here.
+            static std::vector<Q8KBlock> q8Hidden;
+            q8Hidden.resize(blocksPerRow);
+            GGMLDequantize::quantizeQ8K(hidden, hiddenSize, q8Hidden.data());
+
+            ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                const Q8KBlock *embRow = embedData + static_cast<uint64_t>(i) * blocksPerRow;
+                // Software prefetch the next row's weight data to hide DRAM latency
+                // on the large embedding matrix (vocabSize × hiddenSize).
+                if (i + 1 < vocabSize) {
+                    prefetchRow(embRow + blocksPerRow);
+                }
+                double dot = 0.0;
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    dot += static_cast<double>(dotProductQ8K_Q8K_SIMD(&q8Hidden[b], &embRow[b]));
+                }
+                logits[i] = static_cast<float>(dot);
+            });
+        }
+        /// @brief Compute LM head logits using pre‑quantized Q8_K embedding matrix for a single token.
+        /// This thin wrapper forwards to computeCPUQ8K, which performs the actual computation.
+        static void matMulVecQ8K_Single(const float *hidden, const Q8KBlock *embedData,
+                                        uint32_t vocabSize, uint32_t hiddenSize, float *logits) {
+            computeCPUQ8K(hidden, embedData, vocabSize, hiddenSize, logits);
+        }
+
         /// @brief Compute LM head logits on CPU with on-the-fly dequantization.
         ///
         /// For each vocabulary entry i, computes dot(hidden, embedding[i]) where

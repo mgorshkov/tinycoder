@@ -43,6 +43,7 @@ SOFTWARE.
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -671,6 +672,568 @@ TEST_F(ReferenceCompareTest, DumpEmbeddingBlock) {
     EXPECT_GT(fmax, fmin) << "Embedding has no range";
     EXPECT_GT(fmax, 0.0f) << "Embedding max should be positive";
     EXPECT_LT(fmin, 0.0f) << "Embedding min should be negative";
+}
+
+// ---------------------------------------------------------------------------
+// Q3_K batch kernel vs scalar reference (real weights)
+// ---------------------------------------------------------------------------
+// Decisive check for the Q3_K routing introduced for attnO/ffnDown: the AVX2
+// register-tiled batch kernel must reproduce GGMLDequantize::matMulVecFused
+// (scalar Q3_K reference) within the Q8_K x-quantization tolerance. If this
+// passes, any margin in CompareBatchVsSequentialPrefill is attributable to
+// Q3_K's coarser quantization (0.43 B/elem vs 1.14 for Q8_K) amplifying the
+// intrinsic flash-attention batch-vs-sequential activation differences —
+// NOT to a defect in the vector kernel.
+TEST_F(ReferenceCompareTest, Q3K_BatchKernelVsScalar) {
+    const auto &layers = SharedTestEnv::model->debugGetLayers();
+    ASSERT_FALSE(layers.empty());
+
+    struct Case {
+        const QuantizedMatrix *m;
+        std::string name;
+    };
+    std::vector<Case> cases;
+    const QuantizedMatrix &attnO = layers[0].attnO;
+    if (attnO.type == GGML_TYPE_Q3_K && attnO.cols % 256 == 0) {
+        cases.push_back({&attnO, "attnO"});
+    }
+    const QuantizedMatrix &ffnDown = layers[0].ffnDown;
+    if (ffnDown.type == GGML_TYPE_Q3_K && ffnDown.cols % 256 == 0) {
+        cases.push_back({&ffnDown, "ffnDown"});
+    }
+    ASSERT_FALSE(cases.empty()) << "model has no Q3_K attnO/ffnDown to test";
+
+    // ---- Phase 0: pinpoint the defect on ONE real block ----
+    // Dissect the kernel formula on block 0 of row 0:
+    //   scalarFloat : dotProductQ3_K against exact float x (LLaMA reference math)
+    //   scalarQ8    : dotProductQ3_K against dequantized Q8_K x (isolates the
+    //                 Q8_K x-quantization error from the formula error)
+    //   mimic       : the kernel's exact formula (q2+4*hm, (sc-32) scales,
+    //                 bsum compensation) evaluated in plain C++ on the same Q8_
+    //                 x. If mimic matches scalarQ8 but the vector kernel does not,
+    //                 the bug is in the AVX2 implementation; if mimic also differs,
+    //                 the block layout/formula itself disagrees with the scalar.
+    {
+        const auto &m0 = *cases[0].m;
+        const uint32_t cols0 = m0.cols;
+        std::mt19937 rngB(777);
+        std::normal_distribution<float> ndB(0.0f, 1.0f);
+        std::vector<float> xb(cols0);
+        for (uint32_t i = 0; i < cols0; ++i) {
+            xb[i] = ndB(rngB);
+        }
+
+        const uint32_t blockBytes = 110;
+        const uint32_t bpr = (cols0 + 255) / 256;
+        const uint8_t *blk = m0.data.data() + static_cast<uint64_t>(0) * bpr * blockBytes + 0 * blockBytes;
+
+        float dAll = GGMLDequantize::halfToFloat(*(const uint16_t *) (blk + 108));
+        const uint8_t *hm = blk + 0;
+        const uint8_t *q = blk + 32;
+        const uint8_t *scRaw = blk + 96;
+
+        // Unpack the 16 6-bit scales (identical transform to both references).
+        uint32_t aux[4];
+        std::memcpy(aux, scRaw, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & 0x0f0f0f0fu) | (((tmp >> 4) & 0x03030303u) << 4);
+        aux[3] = ((aux[1] >> 4) & 0x0f0f0f0fu) | (((tmp >> 6) & 0x03030303u) << 4);
+        aux[0] = (aux[0] & 0x0f0f0f0fu) | (((tmp >> 0) & 0x03030303u) << 4);
+        aux[1] = (aux[1] & 0x0f0f0f0fu) | (((tmp >> 2) & 0x03030303u) << 4);
+        const int8_t *sc = reinterpret_cast<const int8_t *>(aux);
+
+        // 1) scalar vs exact float x
+        float scalarFloat = GGMLDequantize::dotProductQ3_K(blk, xb.data());
+
+        // 2) Q8_K quantize x and re-feed as dequantized floats
+        Q8KBlock q8b;
+        GGMLDequantize::quantizeQ8K(xb.data(), 256, &q8b);
+        std::vector<float> xq(256);
+        for (int i = 0; i < 256; ++i) {
+            xq[i] = q8b.qs[i] * q8b.d;
+        }
+        float scalarQ8 = GGMLDequantize::dotProductQ3_K(blk, xq.data());
+
+        // 3) mimic the kernel formula exactly (chunk/sub decomposition)
+        double mainTerm = 0.0;
+        int g = 0;
+        for (int cn = 0; cn < 2; ++cn) {
+            int shift = 0;
+            for (int sub = 0; sub < 4; ++sub) {
+                // Chunk cn reads the q quarter at offset cn*32 (NOT 8*(cn*4+sub)):
+                // the kernel's qsrc = q + 32*(s>>2) equals q + 32*cn for the
+                // 4 sub-blocks of each chunk.
+                const uint8_t *qsrc = q + 32 * cn;
+                for (int l = 0; l < 16; ++l) {
+                    int q2 = (qsrc[l] >> shift) & 3;
+                    int hb = (hm[l] >> (cn * 4 + sub)) & 1;
+                    int wp = q2 + 4 * hb;// w' = q2 + 4*hm
+                    int wg = g;
+                    mainTerm += static_cast<double>(sc[wg] - 32) * wp * q8b.qs[cn * 128 + sub * 32 + l];
+                }
+                for (int l = 0; l < 16; ++l) {
+                    int q2 = (qsrc[l + 16] >> shift) & 3;
+                    int hb = (hm[l + 16] >> (cn * 4 + sub)) & 1;
+                    int wp = q2 + 4 * hb;
+                    int wg = g + 1;
+                    mainTerm += static_cast<double>(sc[wg] - 32) * wp * q8b.qs[cn * 128 + sub * 32 + 16 + l];
+                }
+                g += 2;
+                shift += 2;
+            }
+        }
+        double bsumTerm = 0.0;
+        for (int gg = 0; gg < 16; ++gg) {
+            bsumTerm += static_cast<double>(sc[gg] - 32) * q8b.bsums[gg];
+        }
+        bsumTerm *= -4.0 * dAll * q8b.d;
+        double mimic = dAll * q8b.d * mainTerm + bsumTerm;
+
+        std::cout << "  [dissect " << cases[0].name << " block0] dAll=" << dAll
+                  << " scalarFloat=" << scalarFloat << " scalarQ8=" << scalarQ8
+                  << " mimic=" << mimic
+                  << " |mimic-scalarQ8|=" << std::fabs(mimic - scalarQ8)
+                  << " |scalarQ8-scalarFloat|=" << std::fabs(scalarQ8 - scalarFloat)
+                  << std::endl;
+        // If the mimic (kernel formula) is far from scalarQ8, the block layout
+        // decoding itself is wrong (hm/scales/q mapping).
+        // If mimic==scalarQ8, the formula is exact and any kernel error is in the
+        // AVX2 code paths (shuffle lanes, maddubs operand order, etc.).
+    }
+
+    // ---- Phase 1: isolate per-block math on a single-block-per-row matrix ----
+    // Build a fake matrix whose each row holds ONLY block 0 (256 cols) of the
+    // real weights, then compare the AVX2 kernel row-by-row against the scalar
+    // dotProductQ3_K. If rows diverge here, the per-block AVX2 math itself is
+    // wrong on some blocks/rows; if all rows match, the defect is in the
+    // multi-block indexing of the full kernel.
+    {
+        const auto &m0 = *cases[0].m;
+        const uint32_t rows0 = m0.rows;
+        const uint32_t bpr = m0.cols / 256;
+        std::mt19937 rng1(222);
+        std::normal_distribution<float> nd1(0.0f, 1.0f);
+        std::vector<float> x1(256);
+        for (uint32_t i = 0; i < 256; ++i) {
+            x1[i] = nd1(rng1);
+        }
+
+        std::vector<uint8_t> oneBlk(static_cast<size_t>(rows0) * 110);
+        for (uint32_t r = 0; r < rows0; ++r) {
+            std::memcpy(oneBlk.data() + static_cast<size_t>(r) * 110,
+                        m0.data.data() + static_cast<size_t>(r) * bpr * 110, 110);
+        }
+        std::vector<float> kOut1(rows0), sOut1(rows0);
+        bool used1 = matMulVecBatchQ3K_SIMD(oneBlk.data(), x1.data(), 1, rows0, 256,
+                                            kOut1.data());
+        ASSERT_TRUE(used1);
+        for (uint32_t r = 0; r < rows0; ++r) {
+            sOut1[r] = GGMLDequantize::dotProductQ3_K(
+                    oneBlk.data() + static_cast<size_t>(r) * 110, x1.data());
+        }
+        double ph1Max = 0.0;
+        uint32_t ph1BadRow = 0;
+        for (uint32_t r = 0; r < rows0; ++r) {
+            double a = std::fabs(static_cast<double>(kOut1[r]) -
+                                 static_cast<double>(sOut1[r]));
+            if (a > ph1Max) {
+                ph1Max = a;
+                ph1BadRow = r;
+            }
+        }
+        std::cout << "  [phase1 single-block] rows=" << rows0
+                  << " maxAbs=" << ph1Max << " at row " << ph1BadRow
+                  << "  first8 kernel=";
+        for (uint32_t r = 0; r < std::min(8u, rows0); ++r) {
+            std::cout << kOut1[r] << ",";
+        }
+        std::cout << " scalar=";
+        for (uint32_t r = 0; r < std::min(8u, rows0); ++r) {
+            std::cout << sOut1[r] << ",";
+        }
+        std::cout << std::endl;
+
+        // Phase 1b: dissect row 0 of the single-block matrix with the SAME x1.
+        // Recompute the proven-exact mimic and print the split pieces so we can
+        // see whether the SIMD's main term, bsum term, or both diverge.
+        {
+            const uint8_t *blk0 = oneBlk.data();// row 0, block 0
+            Q8KBlock q8b;
+            GGMLDequantize::quantizeQ8K(x1.data(), 256, &q8b);
+            float dAll0 = GGMLDequantize::halfToFloat(*(const uint16_t *) (blk0 + 108));
+            const uint8_t *hm0 = blk0;
+            const uint8_t *q0 = blk0 + 32;
+            uint32_t aux0[4];
+            std::memcpy(aux0, blk0 + 96, 12);
+            uint32_t tmp0 = aux0[2];
+            aux0[2] = ((aux0[0] >> 4) & 0x0f0f0f0fu) | (((tmp0 >> 4) & 0x03030303u) << 4);
+            aux0[3] = ((aux0[1] >> 4) & 0x0f0f0f0fu) | (((tmp0 >> 6) & 0x03030303u) << 4);
+            aux0[0] = (aux0[0] & 0x0f0f0f0fu) | (((tmp0 >> 0) & 0x03030303u) << 4);
+            aux0[1] = (aux0[1] & 0x0f0f0f0fu) | (((tmp0 >> 2) & 0x03030303u) << 4);
+            const int8_t *sc0 = reinterpret_cast<const int8_t *>(aux0);
+            double mainTerm0 = 0.0;
+            int g0 = 0;
+            for (int cn = 0; cn < 2; ++cn) {
+                int shift0 = 0;
+                for (int sub = 0; sub < 4; ++sub) {
+                    const uint8_t *qsrc0 = q0 + 32 * cn;
+                    for (int l = 0; l < 16; ++l) {
+                        int q2 = (qsrc0[l] >> shift0) & 3;
+                        int hb = (hm0[l] >> (cn * 4 + sub)) & 1;
+                        mainTerm0 += static_cast<double>(sc0[g0] - 32) *
+                                     (q2 + 4 * hb) *
+                                     q8b.qs[cn * 128 + sub * 32 + l];
+                    }
+                    for (int l = 0; l < 16; ++l) {
+                        int q2 = (qsrc0[l + 16] >> shift0) & 3;
+                        int hb = (hm0[l + 16] >> (cn * 4 + sub)) & 1;
+                        mainTerm0 += static_cast<double>(sc0[g0 + 1] - 32) *
+                                     (q2 + 4 * hb) *
+                                     q8b.qs[cn * 128 + sub * 32 + 16 + l];
+                    }
+                    g0 += 2;
+                    shift0 += 2;
+                }
+            }
+            double bsumTerm0 = 0.0;
+            for (int gg = 0; gg < 16; ++gg) {
+                bsumTerm0 += static_cast<double>(sc0[gg] - 32) * q8b.bsums[gg];
+            }
+            bsumTerm0 *= -4.0 * dAll0 * q8b.d;
+            double mimic0 = dAll0 * q8b.d * mainTerm0 + bsumTerm0;
+
+            std::cout << "  [phase1b row0 block0] dAll=" << dAll0 << " d=" << q8b.d
+                      << " kernel=" << kOut1[0] << " scalar=" << sOut1[0]
+                      << " mimic=" << mimic0 << " main=" << dAll0 * q8b.d * mainTerm0
+                      << " bsum=" << bsumTerm0 << std::endl;
+            std::cout << "    scales(sc-32)=";
+            for (int gg = 0; gg < 16; ++gg) {
+                std::cout << (int) (sc0[gg] - 32) << ",";
+            }
+            std::cout << " bsums=";
+            for (int gg = 0; gg < 16; ++gg) {
+                std::cout << q8b.bsums[gg] << ",";
+            }
+            std::cout << std::endl;
+        }
+    }
+
+    for (const auto &c: cases) {
+        const uint32_t rows = c.m->rows;
+        const uint32_t cols = c.m->cols;
+
+        // Deterministic pseudo-activation input (unit-normal).
+        std::vector<float> x(cols);
+        std::mt19937 rng(12345);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (uint32_t i = 0; i < cols; ++i) {
+            x[i] = nd(rng);
+        }
+
+        std::vector<float> kernelOut(rows);
+        bool used = matMulVecBatchQ3K_SIMD(
+                c.m->data.data(), x.data(), 1, rows, cols, kernelOut.data());
+        ASSERT_TRUE(used) << "Q3_K vector kernel not dispatched on this host";
+
+        // The kernel computes against a Q8_K-quantized x (per 256-block). The
+        // scalar reference must see the SAME Q8_K-dequantized x; comparing
+        // against the exact float x would inject the Q8_K quantization error
+        // (~1% per element) into the tolerance gate.
+        const uint32_t blockSize = 256;
+        const uint32_t bpr = cols / blockSize;
+        std::vector<float> xq(cols);
+        std::vector<Q8KBlock> q8ref(bpr);
+        for (uint32_t b = 0; b < bpr; ++b) {
+            GGMLDequantize::quantizeQ8K(x.data() + b * blockSize, blockSize,
+                                        &q8ref[b]);
+            for (uint32_t i = 0; i < blockSize; ++i) {
+                xq[b * blockSize + i] = q8ref[b].qs[i] * q8ref[b].d;
+            }
+        }
+        std::vector<float> scalarOut(rows);
+        GGMLDequantize::matMulVecFused(c.m->type, c.m->data.data(), xq.data(),
+                                       rows, cols, scalarOut.data());
+
+        double maxAbs = 0.0, maxRel = 0.0;
+        float refMax = 0.0f;
+        for (uint32_t j = 0; j < rows; ++j) {
+            refMax = std::max(refMax, std::fabs(scalarOut[j]));
+        }
+        for (uint32_t j = 0; j < rows; ++j) {
+            double a = std::fabs(static_cast<double>(kernelOut[j]) -
+                                 static_cast<double>(scalarOut[j]));
+            maxAbs = std::max(maxAbs, a);
+            maxRel = std::max(maxRel,
+                              a / std::max(1e-6, static_cast<double>(std::fabs(
+                                                         scalarOut[j]))));
+        }
+
+        std::cout << "  Q3K " << c.name << " rows=" << rows << " cols=" << cols
+                  << " refMax=" << refMax << " maxAbs=" << maxAbs
+                  << " maxRel=" << maxRel << std::endl;
+
+        // Q8_K x-quantization + fp32 accumulation error is ~0.4% per element;
+        // allow 1% relative and a small absolute floor. A real kernel defect
+        // (wrong scale pairing, bit mis-extraction, missing bsum term) blows
+        // far past this.
+        const float absTol = 0.01f * std::max(1.0f, refMax);
+        EXPECT_LT(maxAbs, static_cast<double>(absTol))
+                << "Q3_K batch kernel deviates from scalar reference (" << c.name << ")";
+    }
+}
+
+TEST_F(ReferenceCompareTest, Q6K_BatchKernelVsScalar) {
+    // Q6_K is how the separate LM head is stored in the model file. Exercise
+    // the AVX2 batch kernel against the scalar dotProductQ6_K (through
+    // matMulVecFused), feeding the reference the SAME Q8_K-dequantized x.
+    const QuantizedMatrix &lmHead = SharedTestEnv::model->debugGetLMHead();
+    if (lmHead.type != GGML_TYPE_Q6_K || lmHead.cols % 256 != 0) {
+        GTEST_SKIP() << "model has no Q6_K LM head to test";
+    }
+    const uint32_t blockBytes = 210;
+
+    // ---- Phase 0: dissect ONE real block ----
+    // scalarFloat : dotProductQ6_K against exact float x
+    // scalarQ8    : dotProductQ6_K against dequantized Q8_K x
+    // mimic       : the kernel's exact formula (raw 6-bit w', raw signed sc,
+    //               -32 bsum compensation) on the same Q8_K x
+    {
+        std::mt19937 rngB(777);
+        std::normal_distribution<float> ndB(0.0f, 1.0f);
+        std::vector<float> xb(256);
+        for (int i = 0; i < 256; ++i) {
+            xb[i] = ndB(rngB);
+        }
+        const uint32_t bpr = lmHead.cols / 256;
+        const uint8_t *blk = lmHead.data.data() + static_cast<uint64_t>(0) * bpr * blockBytes;
+
+        float dAll = GGMLDequantize::halfToFloat(*(const uint16_t *) (blk + 208));
+        const int8_t *sc = reinterpret_cast<const int8_t *>(blk + 192);
+
+        float scalarFloat = GGMLDequantize::dotProductQ6_K(blk, xb.data());
+
+        Q8KBlock q8b;
+        GGMLDequantize::quantizeQ8K(xb.data(), 256, &q8b);
+        std::vector<float> xq(256);
+        for (int i = 0; i < 256; ++i) {
+            xq[i] = q8b.qs[i] * q8b.d;
+        }
+        float scalarQ8 = GGMLDequantize::dotProductQ6_K(blk, xq.data());
+
+        // Mimic the kernel formula: w' = low_nibble | (high2 << 4), value =
+        // d*sc*(w'-32); the -32 folds through the bsum term.
+        double mainTerm = 0.0;
+        for (int n = 0; n < 256; n += 128) {
+            const uint8_t *ql = blk + (n / 2);
+            const uint8_t *qh = blk + 128 + (n / 4);
+            const int8_t *scb = sc + (n / 128) * 8;
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                int w1 = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+                int w2 = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+                int w3 = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+                int w4 = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+                mainTerm += static_cast<double>(scb[is + 0]) * w1 * q8b.qs[n + l];
+                mainTerm += static_cast<double>(scb[is + 2]) * w2 * q8b.qs[n + l + 32];
+                mainTerm += static_cast<double>(scb[is + 4]) * w3 * q8b.qs[n + l + 64];
+                mainTerm += static_cast<double>(scb[is + 6]) * w4 * q8b.qs[n + l + 96];
+            }
+        }
+        double bsumTerm = 0.0;
+        for (int g = 0; g < 16; ++g) {
+            bsumTerm += static_cast<double>(sc[g]) * q8b.bsums[g];
+        }
+        bsumTerm *= -32.0 * dAll * q8b.d;
+        double mimic = dAll * q8b.d * mainTerm + bsumTerm;
+
+        std::cout << "  [Q6K dissect block0] d=" << dAll
+                  << " scalarFloat=" << scalarFloat << " scalarQ8=" << scalarQ8
+                  << " mimic=" << mimic
+                  << " |mimic-scalarQ8|=" << std::fabs(mimic - scalarQ8)
+                  << " |scalarQ8-scalarFloat|=" << std::fabs(scalarQ8 - scalarFloat)
+                  << std::endl;
+    }
+
+    // ---- Phase 1: single-block-per-row matrix, kernel vs scalar ----
+    {
+        const uint32_t rows0 = lmHead.rows;
+        std::mt19937 rng1(222);
+        std::normal_distribution<float> nd1(0.0f, 1.0f);
+        std::vector<float> x1(256);
+        for (uint32_t i = 0; i < 256; ++i) {
+            x1[i] = nd1(rng1);
+        }
+        const uint32_t bpr = lmHead.cols / 256;
+        std::vector<uint8_t> oneBlk(static_cast<size_t>(rows0) * blockBytes);
+        for (uint32_t r = 0; r < rows0; ++r) {
+            std::memcpy(oneBlk.data() + static_cast<size_t>(r) * blockBytes,
+                        lmHead.data.data() + static_cast<size_t>(r) * bpr * blockBytes,
+                        blockBytes);
+        }
+        // Limit Phase 1 to the first 4096 rows for runtime sanity while still
+        // spanning many distinct blocks.
+        uint32_t testRows = std::min(rows0, 4096u);
+        std::vector<float> kOut1(testRows), sOut1(testRows);
+        bool used1 = matMulVecBatchQ6K_SIMD(oneBlk.data(), x1.data(), 1, testRows, 256,
+                                            kOut1.data());
+        ASSERT_TRUE(used1) << "Q6_K vector kernel not dispatched on this host";
+        for (uint32_t r = 0; r < testRows; ++r) {
+            sOut1[r] = GGMLDequantize::dotProductQ6_K(
+                    oneBlk.data() + static_cast<size_t>(r) * blockBytes, x1.data());
+        }
+        double ph1Max = 0.0;
+        for (uint32_t r = 0; r < testRows; ++r) {
+            ph1Max = std::max(ph1Max,
+                              std::fabs(static_cast<double>(kOut1[r]) -
+                                        static_cast<double>(sOut1[r])));
+        }
+        std::cout << "  [Q6K phase1 single-block] rows=" << testRows
+                  << " maxAbs=" << ph1Max << "  first4 kernel=";
+        for (uint32_t r = 0; r < std::min(4u, testRows); ++r) {
+            std::cout << kOut1[r] << ",";
+        }
+        std::cout << " scalar=";
+        for (uint32_t r = 0; r < std::min(4u, testRows); ++r) {
+            std::cout << sOut1[r] << ",";
+        }
+        std::cout << std::endl;
+    }
+
+    // ---- Full matrix, kernel vs scalar reference on the same Q8_K x ----
+    const uint32_t rows = lmHead.rows;
+    const uint32_t cols = lmHead.cols;
+
+    std::vector<float> x(cols);
+    std::mt19937 rng(12345);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (uint32_t i = 0; i < cols; ++i) {
+        x[i] = nd(rng);
+    }
+
+    std::vector<float> kernelOut(rows);
+    auto t0 = std::chrono::steady_clock::now();
+    bool used = matMulVecBatchQ6K_SIMD(lmHead.data.data(), x.data(), 1, rows, cols,
+                                       kernelOut.data());
+    auto t1 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(used) << "Q6_K vector kernel not dispatched on this host";
+    std::cout << "  [Q6K timing] seqLen=1 rows=" << rows << " cols=" << cols
+              << " kernel="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+              << " ms" << std::endl;
+
+    // Feed the scalar reference the Q8_K-dequantized x (same as the kernel).
+    const uint32_t bpr = cols / 256;
+    std::vector<float> xq(cols);
+    std::vector<Q8KBlock> q8ref(bpr);
+    for (uint32_t b = 0; b < bpr; ++b) {
+        GGMLDequantize::quantizeQ8K(x.data() + b * 256, 256, &q8ref[b]);
+        for (uint32_t i = 0; i < 256; ++i) {
+            xq[b * 256 + i] = q8ref[b].qs[i] * q8ref[b].d;
+        }
+    }
+    std::vector<float> scalarOut(rows);
+    GGMLDequantize::matMulVecFused(lmHead.type, lmHead.data.data(), xq.data(),
+                                   rows, cols, scalarOut.data());
+
+    double maxAbs = 0.0, maxRel = 0.0;
+    float refMax = 0.0f;
+    for (uint32_t j = 0; j < rows; ++j) {
+        refMax = std::max(refMax, std::fabs(scalarOut[j]));
+    }
+    for (uint32_t j = 0; j < rows; ++j) {
+        double a = std::fabs(static_cast<double>(kernelOut[j]) -
+                             static_cast<double>(scalarOut[j]));
+        maxAbs = std::max(maxAbs, a);
+        maxRel = std::max(maxRel,
+                          a / std::max(1e-6, static_cast<double>(std::fabs(
+                                                     scalarOut[j]))));
+    }
+    std::cout << "  Q6K lmHead rows=" << rows << " cols=" << cols
+              << " refMax=" << refMax << " maxAbs=" << maxAbs
+              << " maxRel=" << maxRel << std::endl;
+
+    // Q8_K x-quantization + fp32 accumulation error is ~0.4% per element;
+    // allow 1% relative and a small absolute floor (same gate as the Q3_K test).
+    const float absTol = 0.01f * std::max(1.0f, refMax);
+    EXPECT_LT(maxAbs, static_cast<double>(absTol))
+            << "Q6_K batch kernel deviates from scalar reference (lmHead)";
+}
+
+/// @brief Compare the fused compact Q2_K Q+K generation kernel against the
+/// scalar dotProductQ2_K reference for the real attnQ / attnK matrices.
+///
+/// The kernel is used for single-token generation (Task 13); the Q (1536 rows)
+/// and K (256 rows) projections share compact Q2_K 84-byte blocks, so the fused
+/// kernel reads each once and reuses the single Q8_K quantization of x across
+/// both matrices. Feeding the scalar the same Q8_K-dequantized x isolates the
+/// kernel's block math from the x-quantization error.
+TEST_F(ReferenceCompareTest, Q2K_FusedQK_KernelVsScalar) {
+    const auto &layers = SharedTestEnv::model->debugGetLayers();
+    ASSERT_FALSE(layers.empty());
+
+    const QuantizedMatrix &attnQ = layers[0].attnQ;
+    const QuantizedMatrix &attnK = layers[0].attnK;
+    if (attnQ.type != GGML_TYPE_Q2_K || attnK.type != GGML_TYPE_Q2_K ||
+        attnQ.cols != attnK.cols || attnQ.cols % 256 != 0) {
+        GTEST_SKIP() << "layer 0 is not compact Q2_K Q/K with cols%256==0";
+    }
+
+    const uint32_t rowsQ = attnQ.rows;
+    const uint32_t rowsK = attnK.rows;
+    const uint32_t cols = attnQ.cols;
+
+    std::vector<float> x(cols);
+    std::mt19937 rng(4242);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (uint32_t i = 0; i < cols; ++i) {
+        x[i] = nd(rng);
+    }
+
+    std::vector<float> qKern(rowsQ), kKern(rowsK);
+    matMulVecFusedQKQ2_K_Compact_Q8_SIMD(
+            attnQ.data.data(), attnK.data.data(), x.data(),
+            rowsQ, rowsK, cols, qKern.data(), kKern.data());
+
+    // Scalar reference on the SAME Q8_K-dequantized x (same as the kernel).
+    const uint32_t bpr = cols / 256;
+    std::vector<float> xq(cols);
+    std::vector<Q8KBlock> q8ref(bpr);
+    for (uint32_t b = 0; b < bpr; ++b) {
+        GGMLDequantize::quantizeQ8K(x.data() + b * 256, 256, &q8ref[b]);
+        for (uint32_t i = 0; i < 256; ++i) {
+            xq[b * 256 + i] = q8ref[b].qs[i] * q8ref[b].d;
+        }
+    }
+    std::vector<float> qScalar(rowsQ), kScalar(rowsK);
+    GGMLDequantize::matMulVecFused(GGML_TYPE_Q2_K, attnQ.data.data(), xq.data(),
+                                   rowsQ, cols, qScalar.data());
+    GGMLDequantize::matMulVecFused(GGML_TYPE_Q2_K, attnK.data.data(), xq.data(),
+                                   rowsK, cols, kScalar.data());
+
+    auto report = [&](const std::string &label, const std::vector<float> &kern,
+                      const std::vector<float> &ref, uint32_t n) {
+        double maxAbs = 0.0, refMax = 0.0;
+        for (uint32_t j = 0; j < n; ++j) {
+            refMax = std::max(refMax, std::fabs(static_cast<double>(ref[j])));
+        }
+        for (uint32_t j = 0; j < n; ++j) {
+            maxAbs = std::max(maxAbs,
+                              std::fabs(static_cast<double>(kern[j]) -
+                                        static_cast<double>(ref[j])));
+        }
+        std::cout << "  Q2K fusedQK " << label << " rows=" << n << " cols=" << cols
+                  << " refMax=" << refMax << " maxAbs=" << maxAbs << std::endl;
+        return maxAbs;
+    };
+
+    double qAbs = report("Q", qKern, qScalar, rowsQ);
+    double kAbs = report("K", kKern, kScalar, rowsK);
+
+    double qRefMax = 0.0, kRefMax = 0.0;
+    for (uint32_t j = 0; j < rowsQ; ++j) qRefMax = std::max(qRefMax, std::fabs((double) qScalar[j]));
+    for (uint32_t j = 0; j < rowsK; ++j) kRefMax = std::max(kRefMax, std::fabs((double) kScalar[j]));
+    EXPECT_LT(qAbs, 0.01 * std::max(1.0, qRefMax)) << "Q2K fused Q+Q kernel (Q rows) deviates";
+    EXPECT_LT(kAbs, 0.01 * std::max(1.0, kRefMax)) << "Q2K fused Q+K kernel (K rows) deviates";
 }
 
 // Note: main() is in ModelTest.cpp - this file is compiled together with it.

@@ -255,8 +255,9 @@ TEST_F(ModelTest, GenerateTokens) {
 
 struct QuestionAnswer {
     std::string question;
-    std::string expectedKeyword;// keyword expected in the answer
-    int minTokens;              // minimum expected tokens
+    std::string expectedKeyword; // keyword expected in the answer
+    std::string forbiddenKeyword;// keyword that must NOT appear (language guard)
+    int minTokens;               // minimum expected tokens
 };
 
 class SampleQuestionTest
@@ -303,6 +304,8 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     std::cout << "  Generated " << tokenCount << " tokens in " << genMs << " ms ("
               << tokPerSec << " tok/s)" << std::endl;
     std::cout << "  Output: \"" << generatedText << "\"" << std::endl;
+    std::cout << "  (Prefill and generation timing printed by Model::generate above)"
+              << std::endl;
 
     // Check minimum token count
     EXPECT_GE(tokenCount, qa.minTokens);
@@ -317,6 +320,18 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     EXPECT_NE(lowerOutput.find(lowerKeyword), std::string::npos)
             << "Expected keyword '" << qa.expectedKeyword << "' not found in output";
 
+    // Language guard: a forbidden keyword (e.g. model answering the C++ question
+    // in Python) must NOT appear. Catches the lossy Q2_K re-quant quality
+    // regression where Q1 starts emitting "def add(a, b):" instead of C++.
+    if (!qa.forbiddenKeyword.empty()) {
+        std::string lowerForbidden = qa.forbiddenKeyword;
+        std::transform(lowerForbidden.begin(), lowerForbidden.end(),
+                       lowerForbidden.begin(), ::tolower);
+        EXPECT_EQ(lowerOutput.find(lowerForbidden), std::string::npos)
+                << "Output must NOT contain forbidden keyword '"
+                << qa.forbiddenKeyword << "'";
+    }
+
     // Clear KV cache between questions
     SharedTestEnv::model->clearKVCache();
 }
@@ -325,11 +340,14 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
 // Note: These are end-to-end generation tests with sampling. The model is
 // heavily quantized (IQ3_XXS, 3.06 bpw), so output quality is limited.
 // Keywords are chosen to match the model's actual sampled output.
+// Language-guard keywords: Q1 and Q3 ask for C++ code, so a bare-Python answer
+// ("def ...:") is a regression signal (lossy Q2_K re-quant). Q2 (factual) and
+// Q4 (Python) have no forbidden keyword.
 static const QuestionAnswer fullQuestions[] = {
-        {"Write a C++ function to add two numbers.", "return", 10},
-        {"What is the capital of France?", "Paris", 5},
-        {"Explain what a pointer is in C++.", "address", 10},
-        {"Write a for loop in Python that prints numbers 1 to 5.", "for", 10},
+        {"Write a C++ function to add two numbers.", "return", "def ", 10},
+        {"What is the capital of France?", "Paris", "", 5},
+        {"Explain what a pointer is in C++.", "address", "def ", 10},
+        {"Write a for loop in Python that prints numbers 1 to 5.", "for", "", 10},
 };
 
 INSTANTIATE_TEST_SUITE_P(FullQuestions, SampleQuestionTest,
@@ -548,9 +566,13 @@ TEST_F(ModelTest, CompareBatchVsSequentialPrefill) {
         }
     } else {
         std::cout << "\n*** BATCH AND SEQUENTIAL DIFFER! ***" << std::endl;
-        std::cout << "The batch prefill path has a bug that doesn't exist in sequential." << std::endl;
+        std::cout << "maxDiff=" << maxDiff << std::endl;
     }
 
+    // Numeric gate: batch and sequential run identical deterministic kernels, so
+    // a large diff signals a routing/math bug (e.g. a scalar-broadcast bsum
+    // compensation counted 8x). top-1 must match exactly (Q3_K precision keeps
+    // the coherence guard meaningful).
     EXPECT_LT(maxDiff, 5.0f)
             << "Batch prefill differs significantly from sequential! maxDiff=" << maxDiff;
     EXPECT_TRUE(top1Match)

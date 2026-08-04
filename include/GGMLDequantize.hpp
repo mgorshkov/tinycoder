@@ -33,6 +33,7 @@ SOFTWARE.
 #include <iostream>
 #include <vector>
 
+#include "AlignedVector.hpp"
 #include "GGUFLoader.hpp"
 #include "SIMDMatMulVec.hpp"
 #include "ThreadPool.hpp"
@@ -117,6 +118,35 @@ namespace tinycoder {
             float result;
             std::memcpy(&result, &f32, sizeof(float));
             return result;
+        }
+
+        /// @brief Branch-free fp16->fp32 conversion via a 64 KiB LUT.
+        ///
+        /// The scalar halfToFloat() above is called per (row, block) in the hot
+        /// mat-vec kernels — millions of times per generated token — and each
+        /// call executes 2-3 data-dependent branches (exp==0 / exp==31 / else,
+        /// plus the subnormal while loop). This LUT performs the SAME conversion
+        /// with ZERO branches: index the 16-bit pattern once, load the float.
+        ///
+        /// - Bit-exact vs halfToFloat() (verified — the LUT replicates the
+        ///   scalar math for every one of the 65536 patterns).
+        /// - 64 KiB table, L1-resident (L1D on Haswell is 32 KiB per core, so a
+        ///   hot working set of block d/dmin pairs stays cached).
+        /// - Read-only after first touch; function-local static with built-in
+        ///   thread-safety (magic static).
+        static const float *halfToFloatTable() {
+            static const float *table = []() {
+                static std::vector<float> t(65536);
+                for (uint32_t i = 0; i < 65536; ++i) {
+                    t[i] = halfToFloat(static_cast<uint16_t>(i));
+                }
+                return t.data();
+            }();
+            return table;
+        }
+
+        static float halfToFloatBranchFree(uint16_t h) {
+            return halfToFloatTable()[h];
         }
 
         /// @brief Dequantize a Q5_0 block (32 weights, 22 bytes per block).
@@ -1594,19 +1624,24 @@ namespace tinycoder {
             // Initialize result to zero
             std::memset(result, 0, static_cast<size_t>(rows) * sizeof(float));
 
-            // Cache-blocked loop: process one block across all rows
-            // This keeps x[b*blockSize..] in L1 cache
-            for (uint32_t b = 0; b < blocksPerRow; ++b) {
-                uint32_t start = b * blockSize;
-                uint32_t n = std::min(blockSize, cols - start);
-                const float *xBlock = x + start;
-
-                for (uint32_t j = 0; j < rows; ++j) {
-                    const uint8_t *blockData = data + static_cast<uint64_t>(j) * rowStrideBytes + static_cast<uint64_t>(b) * typeSize;
+            // Parallelize over output rows. Each thread owns a contiguous range of
+            // rows and iterates over all block columns for those rows, keeping the
+            // x segment in L1 per-thread. For single-token generation (seqLen==1)
+            // the outer token-level parallelFor is bypassed, making this the only
+            // source of parallelism (uses all threads). For seqLen>1 the ThreadPool
+            // re-entrancy guard runs this sequentially.
+            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+                const uint8_t *rowData = data + static_cast<uint64_t>(j) * rowStrideBytes;
+                double dot = 0.0;
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    const uint8_t *blockData = rowData + static_cast<uint64_t>(b) * typeSize;
+                    uint32_t start = b * blockSize;
+                    uint32_t n = std::min(blockSize, cols - start);
                     // Fused quantized dot product for this block
-                    result[j] += dotProductFused(ggmlType, blockData, xBlock, n);
+                    dot += static_cast<double>(dotProductFused(ggmlType, blockData, x + start, n));
                 }
-            }
+                result[j] = static_cast<float>(dot);
+            });
         }
 
         /// @brief Dequantize any supported GGML type to float32.
@@ -1828,6 +1863,439 @@ namespace tinycoder {
                 }
                 result[j] = static_cast<float>(dot);
             }
+        }
+
+        /// @brief Quantize a float vector x into Q8_K blocks
+        /// @param x        Input vector (size >= numElements)
+        /// @param numElements Number of elements to quantize (must be multiple of 256)
+        /// @param out      Output Q8_K blocks (size numElements/256)
+        static void quantizeQ8K(const float *x, uint32_t numElements,
+                                Q8KBlock *out) {
+            static constexpr uint32_t BLOCK_SIZE = 256;
+            uint32_t numBlocks = numElements / BLOCK_SIZE;
+
+            for (uint32_t b = 0; b < numBlocks; ++b) {
+                const float *xb = x + static_cast<uint64_t>(b) * BLOCK_SIZE;
+                Q8KBlock &blk = out[b];
+
+                float max = 0.0f;
+                float amax = 0.0f;
+                for (uint32_t j = 0; j < BLOCK_SIZE; ++j) {
+                    float ax = std::fabs(xb[j]);
+                    if (ax > amax) {
+                        amax = ax;
+                        max = xb[j];
+                    }
+                }
+                if (amax == 0.0f) {
+                    blk.d = 0.0f;
+                    std::memset(blk.qs, 0, BLOCK_SIZE);
+                    std::memset(blk.bsums, 0, sizeof(blk.bsums));
+                    continue;
+                }
+                const float iscale = -127.0f / max;
+                for (uint32_t j = 0; j < BLOCK_SIZE; ++j) {
+                    int v = static_cast<int>(std::lrintf(iscale * xb[j]));
+                    blk.qs[j] = static_cast<int8_t>(std::min(127, v));
+                }
+                for (uint32_t j = 0; j < BLOCK_SIZE / 16; ++j) {
+                    int sum = 0;
+                    for (uint32_t ii = 0; ii < 16; ++ii) {
+                        sum += blk.qs[j * 16 + ii];
+                    }
+                    blk.bsums[j] = static_cast<int16_t>(sum);
+                }
+                blk.d = 1.0f / iscale;
+            }
+        }
+
+
+        /// @brief Re-quantize a full row of floats to COMPACT Q2_K blocks (84
+        /// bytes per 256-element block), matching the dequantizeQ2_KBlock layout:
+        /// scales[16] (4-bit scale low nibble / min high nibble), qs[64] (2-bit
+        /// planes), fp16 d at +80, fp16 dmin at +82.
+        ///
+        /// This is a load-time byte-reduction primitive (plan §7 "re-quant to a
+        /// lower-bit K-quant at load time"): matrices streamed whole every token
+        /// (separate LM head Q6_K→Q2_K: 210→84 B/block; ffnDown Q3_K→Q2_K:
+        /// 110→84 B/block) shrink their per-token DRAM traffic ~2.5×/1.3×.
+        ///
+        /// Quantization scheme per 16-element group:
+        ///   - mn>=0 groups: dl = mx/3, min term ml = 0
+        ///   - mn<0  groups: dl = (mx-mn)/3, min term ml = -mn
+        ///   - dequant out = dl*q - ml with q in {0,1,2,3} → covers [mn, mx]
+        /// Block super-scales d = max(dl)/15 and dmin = max(ml)/15 (fp16), with
+        /// 4-bit per-group indices rounded into 0..15.
+        ///
+        /// @param x            Row of floats (numElements elements)
+        /// @param numElements  Must be a multiple of 256
+        /// @param outQ2K       Output compact Q2_K bytes
+        ///                     (numElements/256 blocks × 84 bytes)
+        static void quantizeQ2KRow(const float *x, uint32_t numElements,
+                                   uint8_t *outQ2K) {
+            static constexpr uint32_t BLOCK_SIZE = 256;
+            static constexpr uint32_t BLOCK_BYTES = 84;
+            const uint32_t numBlocks = numElements / BLOCK_SIZE;
+
+            for (uint32_t b = 0; b < numBlocks; ++b) {
+                const float *xb = x + static_cast<uint64_t>(b) * BLOCK_SIZE;
+                uint8_t *blk = outQ2K + static_cast<uint64_t>(b) * BLOCK_BYTES;
+
+                float groupDl[16] = {0.0f};
+                float groupMl[16] = {0.0f};
+                uint8_t qvals[256] = {0};
+                float maxDl = 0.0f, maxMl = 0.0f;
+
+                for (uint32_t g = 0; g < 16; ++g) {
+                    const float *xr = xb + g * 16;
+                    float mn = xr[0], mx = xr[0];
+                    for (uint32_t l = 1; l < 16; ++l) {
+                        mn = std::min(mn, xr[l]);
+                        mx = std::max(mx, xr[l]);
+                    }
+                    float dl, ml;
+                    if (mn >= 0.0f) {
+                        // Fully non-negative group: no min term needed.
+                        dl = mx / 3.0f;
+                        ml = 0.0f;
+                    } else {
+                        // Group has negatives: min term -ml maps q=0 -> mn.
+                        dl = (mx - mn) / 3.0f;
+                        ml = -mn;
+                    }
+                    groupDl[g] = dl;
+                    groupMl[g] = ml;
+                    maxDl = std::max(maxDl, dl);
+                    maxMl = std::max(maxMl, ml);
+
+                    // 2-bit quants: dequant(q) = dl*q - ml, so the exact inverse
+                    // is q = (x + ml)/dl (ml is 0 for non-negative groups).
+                    // WITHOUT the +ml the min-shifted codebook maps x=0 to ~mn
+                    // and the round-trip error is ~1.4x the signal (found via
+                    // the QuantizeQ2KRowRoundtrip test).
+                    for (uint32_t l = 0; l < 16; ++l) {
+                        int q;
+                        if (dl > 1e-30f) {
+                            q = static_cast<int>(std::lrintf((xr[l] + ml) / dl));
+                        } else {
+                            q = 0;
+                        }
+                        q = std::min(3, std::max(0, q));
+                        qvals[g * 16 + l] = static_cast<uint8_t>(q);
+                    }
+                }
+
+                // Block super-scales: d = max(dl)/15, dmin = max(ml)/15 (fp16).
+                const uint16_t hD = (maxDl > 0.0f) ? floatToHalf(maxDl / 15.0f) : 0;
+                const uint16_t hDmin = (maxMl > 0.0f) ? floatToHalf(maxMl / 15.0f) : 0;
+                const float dF = halfToFloat(hD);
+                const float dminF = halfToFloat(hDmin);
+
+                for (uint32_t g = 0; g < 16; ++g) {
+                    int lowIdx = (dF > 1e-30f)
+                                         ? static_cast<int>(std::lrintf(groupDl[g] / dF))
+                                         : 0;
+                    int highIdx = (dminF > 1e-30f)
+                                          ? static_cast<int>(std::lrintf(groupMl[g] / dminF))
+                                          : 0;
+                    lowIdx = std::min(15, std::max(0, lowIdx));
+                    highIdx = std::min(15, std::max(0, highIdx));
+                    blk[g] = static_cast<uint8_t>(lowIdx | (highIdx << 4));
+                }
+
+                // Pack 2-bit planes: qs[byteBase + l] |= q << shift. The
+                // (byteBase, shift) mapping above is EXACTLY the read order of
+                // dequantizeQ2_KBlock / prepackQ2_K / the compact Q2_K SIMD
+                // kernels (quarter 0 shift 0,2,4,6 then quarter 1).
+                std::memset(blk + 16, 0, BLOCK_SIZE / 4);
+                for (uint32_t e = 0; e < BLOCK_SIZE; ++e) {
+                    const uint32_t g = e >> 4;
+                    const uint32_t l = e & 15;
+                    const int shift = static_cast<int>(((g >> 1) & 3) * 2);
+                    const int byteBase = static_cast<int>((g & 1) * 16 +
+                                                          ((g & 8) ? 32 : 0));
+                    blk[16 + byteBase + l] |= static_cast<uint8_t>(qvals[e] << shift);
+                }
+                std::memcpy(blk + 80, &hD, 2);
+                std::memcpy(blk + 82, &hDmin, 2);
+            }
+        }
+
+        /// @brief Matrix-vector multiply using pre-packed Q2_K data
+        /// The x vector is quantized to Q8_K (int8) once per matmul, then each
+        /// row's dot product uses _mm256_maddubs_epi16 (32 int8×int8->int16
+        /// multiply-adds per instruction) instead of float FMAs (8 per
+        /// instruction).
+        ///
+        /// @param prepackedData Pre-packed Q2_K data (from prepackQ2_K)
+        /// @param x             Input vector (size cols)
+        /// @param rows          Number of output rows
+        /// @param cols          Number of input columns
+        /// @param result        Output buffer (size rows)
+        static void matMulVecFusedQ2_K_PrePacked_Q8(const uint8_t *prepackedData,
+                                                    const float *x, uint32_t rows,
+                                                    uint32_t cols, float *result) {
+            // Row-parallel prepacked Q8 path: quantize x to Q8_K once, then
+            // parallelize over output rows. This is preferred over the register-tiled
+            // batch GEMM kernel for single-token generation because the batch GEMM
+            // allocates xCopy/q8 vectors on the heap on every call (slow) and its
+            // 8-row register tiling gives no benefit when the matrix is cache-resident.
+            static constexpr uint32_t BLOCK_SIZE = 256;
+            static constexpr uint32_t PREPACKED_BLOCK_BYTES = 276;
+            // Max Q8_K blocks we can hold on the stack (covers cols up to 16384).
+            // Q8KBlock is 292 B, so 64 blocks = ~18 KB of stack.
+            static constexpr uint32_t MAX_STACK_BLOCKS = 64;
+
+            uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            uint64_t rowStrideBytes = static_cast<uint64_t>(blocksPerRow) * PREPACKED_BLOCK_BYTES;
+
+            // Quantize x to Q8_K once per matmul (reused across all rows).
+            // Use a stack buffer to avoid per-call heap allocation.
+            Q8KBlock stackQ8[MAX_STACK_BLOCKS];
+            Q8KBlock *q8 = stackQ8;
+            std::vector<Q8KBlock> heapQ8;
+            if (blocksPerRow > MAX_STACK_BLOCKS) {
+                heapQ8.resize(blocksPerRow);
+                q8 = heapQ8.data();
+            }
+            quantizeQ8K(x, cols, q8);
+
+            // Parallelize over output rows.
+            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+                const uint8_t *rowData = prepackedData + static_cast<uint64_t>(j) * rowStrideBytes;
+                double dot = 0.0;
+
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    const uint8_t *blockData = rowData + static_cast<uint64_t>(b) * PREPACKED_BLOCK_BYTES;
+                    uint32_t start = b * BLOCK_SIZE;
+                    uint32_t n = std::min(BLOCK_SIZE, cols - start);
+
+                    if (n < BLOCK_SIZE) {
+                        // Partial block: dequantize then dot product
+                        float blockOut[256];
+                        dequantizeQ2_K_PrePackedBlock(blockData, blockOut, n);
+                        for (uint32_t i = 0; i < n; ++i) {
+                            dot += static_cast<double>(x[start + i]) * blockOut[i];
+                        }
+                    } else {
+                        // Full block: use Q8_K SIMD kernel
+                        dot += static_cast<double>(dotProductQ2_K_PrePacked_Q8_SIMD(blockData, &q8[b]));
+                    }
+                }
+                result[j] = static_cast<float>(dot);
+            });
+        }
+
+        /// @brief Fused gate+up matrix-vector multiply for pre-packed Q2_K data.
+        ///
+        /// Computes gate = x * W_gate^T and up = x * W_up^T in a single pass over
+        /// the input vector x. Both matrices share the same dimensions (rows x cols)
+        /// and read the same x, so quantizing x to Q8_K once (instead of once per
+        /// matrix) halves the dominant x-vector memory traffic. Each output row's
+        /// dot product uses _mm256_maddubs_epi16 (32 int8×int8->int16 multiply-adds
+        /// per instruction) instead of float FMAs (8 per instruction).
+        ///
+        /// @param gatePrepacked Pre-packed Q2_K data for the gate matrix
+        /// @param upPrepacked   Pre-packed Q2_K data for the up matrix
+        /// @param x             Input vector (size cols)
+        /// @param rows          Number of output rows
+        /// @param cols          Number of input columns
+        /// @param gateOut       Output buffer for gate (size rows)
+        /// @param upOut         Output buffer for up (size rows)
+        static void matMulVecFusedGateUpQ2_K_PrePacked_Q8(
+                const uint8_t *gatePrepacked, const uint8_t *upPrepacked,
+                const float *x, uint32_t rows, uint32_t cols,
+                float *gateOut, float *upOut) {
+            // Use register-tiled batch GEMM for large matrices (BATCH_SIZE=8 rows).
+            // This keeps Q8_K data in registers across all rows in the batch AND
+            // across both gate/up matrices, eliminating redundant memory reads.
+            static constexpr uint32_t MIN_ROWS_FOR_BATCH = 64;
+
+            if (rows >= MIN_ROWS_FOR_BATCH && cols % 256 == 0) {
+                tinycoder::matMulVecBatchGateUpQ2_K_PrePacked_Q8_SIMD(
+                        gatePrepacked, upPrepacked, x, rows, cols, gateOut, upOut);
+                return;
+            }
+
+            static constexpr uint32_t BLOCK_SIZE = 256;
+            static constexpr uint32_t PREPACKED_BLOCK_BYTES = 276;
+
+            uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            uint64_t rowStrideBytes = static_cast<uint64_t>(blocksPerRow) * PREPACKED_BLOCK_BYTES;
+
+            // Quantize x to Q8_K once per fused matmul (reused across all rows of
+            // BOTH matrices). This is the key win: the original code quantized x
+            // separately for ffnGate and ffnUp, reading x twice.
+            std::vector<Q8KBlock> q8(blocksPerRow);
+            quantizeQ8K(x, cols, q8.data());
+
+            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+                const uint8_t *gateRow = gatePrepacked + static_cast<uint64_t>(j) * rowStrideBytes;
+                const uint8_t *upRow = upPrepacked + static_cast<uint64_t>(j) * rowStrideBytes;
+                double gateDot = 0.0;
+                double upDot = 0.0;
+
+                // Software prefetch the next row's weight data to hide DRAM latency
+                // on the large gate/up matrices (8960×1536 each).
+                if (j + 1 < rows) {
+                    prefetchRow(gateRow + rowStrideBytes);
+                    prefetchRow(upRow + rowStrideBytes);
+                }
+
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    const uint8_t *gateBlock = gateRow + static_cast<uint64_t>(b) * PREPACKED_BLOCK_BYTES;
+                    const uint8_t *upBlock = upRow + static_cast<uint64_t>(b) * PREPACKED_BLOCK_BYTES;
+                    uint32_t start = b * BLOCK_SIZE;
+                    uint32_t n = std::min(BLOCK_SIZE, cols - start);
+
+                    if (n < BLOCK_SIZE) {
+                        // Partial block: dequantize then dot product
+                        float blockOut[256];
+                        dequantizeQ2_K_PrePackedBlock(gateBlock, blockOut, n);
+                        for (uint32_t i = 0; i < n; ++i) {
+                            gateDot += static_cast<double>(x[start + i]) * blockOut[i];
+                        }
+                        dequantizeQ2_K_PrePackedBlock(upBlock, blockOut, n);
+                        for (uint32_t i = 0; i < n; ++i) {
+                            upDot += static_cast<double>(x[start + i]) * blockOut[i];
+                        }
+                    } else {
+                        // Full block: use Q8_K SIMD kernel for both matrices
+                        gateDot += static_cast<double>(dotProductQ2_K_PrePacked_Q8_SIMD(gateBlock, &q8[b]));
+                        upDot += static_cast<double>(dotProductQ2_K_PrePacked_Q8_SIMD(upBlock, &q8[b]));
+                    }
+                }
+                gateOut[j] = static_cast<float>(gateDot);
+                upOut[j] = static_cast<float>(upDot);
+            });
+        }
+
+        /// @brief Fused gate+up matrix-vector multiply for COMPACT (raw) Q2_K
+        /// data — single-token (generation) fast path.
+        ///
+        /// Identical maths to matMulVecFusedGateUpQ2_K_PrePacked_Q8 but reads the
+        /// raw 84-byte Q2_K blocks (scales[16], qs[64] packed 2-bit, fp16 d/dmin)
+        /// and unpacks the 2-bit quants to bytes on the fly inside the kernel.
+        /// Generation is DRAM-bandwidth-bound and gate+up is the dominant
+        /// per-token cost; the compact layout is 84 B/block vs 276 B/block for the
+        /// prepacked copy — a ~3.3x reduction in weight traffic (matches llama.cpp).
+        ///
+        /// @param gateData Raw (compact) Q2_K data for the gate matrix
+        /// @param upData   Raw (compact) Q2_K data for the up matrix
+        /// @param x        Input vector (size cols)
+        /// @param rows     Number of output rows
+        /// @param cols     Number of input columns
+        /// @param gateOut  Output buffer for gate (size rows)
+        /// @param upOut    Output buffer for up (size rows)
+        static void matMulVecFusedGateUpQ2_K_Compact_Q8(
+                const uint8_t *gateData, const uint8_t *upData,
+                const float *x, uint32_t rows, uint32_t cols,
+                float *gateOut, float *upOut, bool applySwish) {
+            // Use the register-tiled batch GEMM for large matrices (BATCH_SIZE=8
+            // rows). This keeps Q8_K data in registers across all rows in the
+            // batch AND across both gate/up matrices, eliminating redundant
+            // memory reads.
+            static constexpr uint32_t MIN_ROWS_FOR_BATCH = 64;
+
+            if (rows >= MIN_ROWS_FOR_BATCH && cols % 256 == 0) {
+                tinycoder::matMulVecFusedGateUpQ2_K_Compact_Q8_SIMD(
+                        gateData, upData, x, rows, cols, gateOut, upOut,
+                        applySwish);
+                return;
+            }
+
+            static constexpr uint32_t BLOCK_SIZE = 256;
+            static constexpr uint32_t COMPACT_BLOCK_BYTES = 84;
+
+            uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            uint64_t rowStrideBytes =
+                    static_cast<uint64_t>(blocksPerRow) * COMPACT_BLOCK_BYTES;
+
+            // Quantize x to Q8_K once per fused matmul (reused across all rows of
+            // BOTH matrices). This is the key win: the original code quantized x
+            // separately for ffnGate and ffnUp, reading x twice.
+            std::vector<Q8KBlock> q8(blocksPerRow);
+            quantizeQ8K(x, cols, q8.data());
+
+            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+                const uint8_t *gateRow = gateData + static_cast<uint64_t>(j) * rowStrideBytes;
+                const uint8_t *upRow = upData + static_cast<uint64_t>(j) * rowStrideBytes;
+                double gateDot = 0.0;
+                double upDot = 0.0;
+
+                // Software prefetch the next row's weight data to hide DRAM
+                // latency on the large gate/up matrices (8960x1536 each).
+                if (j + 1 < rows) {
+                    prefetchRow(gateRow + rowStrideBytes);
+                    prefetchRow(upRow + rowStrideBytes);
+                }
+
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    const uint8_t *gateBlock = gateRow + static_cast<uint64_t>(b) * COMPACT_BLOCK_BYTES;
+                    const uint8_t *upBlock = upRow + static_cast<uint64_t>(b) * COMPACT_BLOCK_BYTES;
+                    uint32_t start = b * BLOCK_SIZE;
+                    uint32_t n = std::min(BLOCK_SIZE, cols - start);
+
+                    if (n < BLOCK_SIZE) {
+                        // Partial block: dequantize then dot product
+                        float blockOut[256];
+                        dequantizeQ2_KBlock(gateBlock, blockOut);
+                        for (uint32_t i = 0; i < n; ++i) {
+                            gateDot += static_cast<double>(x[start + i]) * blockOut[i];
+                        }
+                        dequantizeQ2_KBlock(upBlock, blockOut);
+                        for (uint32_t i = 0; i < n; ++i) {
+                            upDot += static_cast<double>(x[start + i]) * blockOut[i];
+                        }
+                    } else {
+                        // Full block: use Q8_K SIMD kernel for both matrices.
+                        // Decompose each compact block once (to the same float
+                        // values the prepacked expansion produces), then dot it
+                        // against the same Q8_K x data.
+                        for (uint32_t mat = 0; mat < 2; ++mat) {
+                            const uint8_t *blk = mat == 0 ? gateBlock : upBlock;
+                            float d = halfToFloat(*(const uint16_t *) (blk + 80));
+                            float dmin = halfToFloat(*(const uint16_t *) (blk + 82));
+                            const uint8_t *sc = blk;
+                            const uint8_t *q = blk + 16;
+                            double &dotRef = mat == 0 ? gateDot : upDot;
+                            int is = 0;
+                            for (int nn = 0; nn < 256; nn += 128) {
+                                int shift = 0;
+                                for (int jj = 0; jj < 4; ++jj) {
+                                    uint8_t scv = sc[is++];
+                                    float dl = d * (scv & 0xF);
+                                    float ml = dmin * (scv >> 4);
+                                    for (int l = 0; l < 16; ++l) {
+                                        float w = dl * ((int8_t) ((q[l] >> shift) & 3)) - ml;
+                                        dotRef += static_cast<double>(x[start + nn + jj * 32 + l]) * w;
+                                    }
+                                    scv = sc[is++];
+                                    dl = d * (scv & 0xF);
+                                    ml = dmin * (scv >> 4);
+                                    for (int l = 0; l < 16; ++l) {
+                                        float w = dl * ((int8_t) ((q[l + 16] >> shift) & 3)) - ml;
+                                        dotRef += static_cast<double>(x[start + nn + jj * 32 + 16 + l]) * w;
+                                    }
+                                    shift += 2;
+                                }
+                                q += 32;
+                            }
+                        }
+                    }
+                }
+                if (applySwish) {
+                    // Fuse SwiGLU into the epilogue (silu(gate) * up) so all
+                    // dispatch routes are semantically identical to the fused
+                    // AVX2 kernel.
+                    float gv = static_cast<float>(gateDot);
+                    gv = gv / (1.0f + std::exp(-gv));
+                    gateOut[j] = gv * static_cast<float>(upDot);
+                } else {
+                    gateOut[j] = static_cast<float>(gateDot);
+                }
+                upOut[j] = static_cast<float>(upDot);
+            });
         }
     };
 
