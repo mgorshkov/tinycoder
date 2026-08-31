@@ -2,7 +2,11 @@ cmake_minimum_required(VERSION 3.18.0)
 
 # TinyCoder - VS Code AI Coding Extension
 # Uses np library for NumPy-style arrays with SIMD (AVX2/AVX512/AMX) and CUDA GPU
-project(tinycoder VERSION 0.3.0 DESCRIPTION "High-Performant Local AI coding agent" LANGUAGES CXX)
+# The C++/CUDA inference engine lives in a separate repository
+# (https://github.com/mgorshkov/tinycoder-inference) and is consumed here via
+# FetchContent as the tinycoder_core static library. This tree keeps only the
+# N-API bridge (src/cpp/bridge) and the TypeScript extension sources.
+project(tinycoder VERSION 0.4.0 DESCRIPTION "High-Performant Local AI coding agent" LANGUAGES CXX)
 enable_testing()
 
 # ---- Options ----
@@ -62,10 +66,17 @@ FetchContent_MakeAvailable(cmake)
 # Apply global cmake options (compiler checks, CUDA setup, OpenMP, etc.)
 include(${cmake_SOURCE_DIR}/Config.cmake)
 
-# ---- Fetch np library ----
+# ---- Fetch the inference engine ----
+# The C++/CUDA inference core now lives in its own repository
+# (https://github.com/mgorshkov/tinycoder-inference). It compiles the engine sources
+# (src/cpp/core) exactly once into the tinycoder_core static library, which the
+# native addon links against. All engine options (SIMD flags, fused FFN
+# scheduling, thread affinity, CUDA, ...) and the engine's unit tests +
+# benchmarks live there; BUILD_TESTS is forced OFF here because the tests are
+# run standalone inside the inference repository.
 FetchContent_Declare(
-    np
-    GIT_REPOSITORY https://github.com/mgorshkov/np.git
+    tinycoder_inference
+    GIT_REPOSITORY https://github.com/mgorshkov/tinycoder-inference.git
     GIT_TAG main
     GIT_SHALLOW TRUE
     CMAKE_ARGS
@@ -79,9 +90,19 @@ FetchContent_Declare(
     -DENABLE_AMX=${ENABLE_AMX}
     -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS}
     -DDEBUG_INFO=${DEBUG_INFO}
+    -DTINYCODER_FFN_STEAL=${TINYCODER_FFN_STEAL}
+    -DTINYCODER_AFFINITY=${TINYCODER_AFFINITY}
+    -DTINYCODER_COOP_QUANTIZE=${TINYCODER_COOP_QUANTIZE}
+    -DTINYCODER_STEAL_CHUNK=${TINYCODER_STEAL_CHUNK}
+    -DBUILD_TESTS=OFF
 )
 
-FetchContent_MakeAvailable(np)
+# Force the engine's tests/benchmarks OFF when embedded. FetchContent_MakeAvailable
+# adds the subproject with add_subdirectory(), which ignores the CMAKE_ARGS above;
+# without this cache variable the engine's option(BUILD_TESTS ... ON) default would
+# pull googletest and the engine test/bench targets into the addon build.
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(tinycoder_inference)
 
 # ---- Find N-API (Node.js Addon API) ----
 # node-addon-api is fetched via npm, we find it in node_modules
@@ -127,153 +148,10 @@ endif()
 message(STATUS "N-API addon: ${NODE_ADDON_API_DIR}")
 message(STATUS "Node API headers: ${NODE_API_HEADER_DIR}")
 
-# ---- Core engine library ----
-# All engine sources live in src/cpp/core and are compiled exactly once into a
-# static library (tinycoder_core). Both the native addon and the unit tests link
-# against it, so the engine sources are never duplicated across targets.
-file(GLOB TINYCODER_CORE_SOURCES CONFIGURE_DEPENDS
-    ${CMAKE_SOURCE_DIR}/src/cpp/core/*.cpp
-)
-
-# CUDA source files (only compiled when CUDA is enabled)
-if(ENABLE_CUDA)
-    file(GLOB TINYCODER_CUDA_SOURCES CONFIGURE_DEPENDS
-        ${CMAKE_SOURCE_DIR}/src/cpp/core/*.cu
-    )
-    list(APPEND TINYCODER_CORE_SOURCES ${TINYCODER_CUDA_SOURCES})
-    # The CUDA runtime needs explicit cuBLAS (already found below) plus the
-    # shared library path for nvcc device-linking.
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
-endif()
-
-set(TINYCODER_HEADERS
-    include/ChatTemplateRenderer.hpp
-    include/ModelConfig.hpp
-    include/GGUFLoader.hpp
-    include/IQ3XXS.hpp
-    include/LMHead.hpp
-    include/LMHeadCUDA.hpp
-    include/ThreadPool.hpp
-    include/Tokenizer.hpp
-    include/Model.hpp
-    include/ModelInternal.hpp
-    include/SIMDMatMulVec.hpp
-    include/SIMDMatMulVecInternal.hpp
-)
-
-# ---- SIMD compile flags for the SIMD mat-vec kernels ----
-# The scalar implementations and runtime dispatch live in SIMDMatMulVec.cpp,
-# which is compiled WITHOUT SIMD ISA extensions. The AVX2 and AVX-512 kernels
-# live in their own translation units (SIMDMatMulVecAVX2.cpp /
-# SIMDMatMulVecAVX512.cpp) so that per-file flags can enable the required ISA
-# without forcing AVX/AVX-512/AMX code generation onto the rest of the codebase.
-# Each kernel file uses #ifdef guards so it compiles to an empty TU when the
-# corresponding ISA is disabled.
-set(SIMD_MATMUL_AVX2_FLAGS "")
-if(ENABLE_AVX2)
-    set(SIMD_MATMUL_AVX2_FLAGS "${SIMD_MATMUL_AVX2_FLAGS} -mavx2 -mfma -mf16c")
-endif()
-if(TINYCODER_FFN_STEAL)
-    # Lever 1 A/B: route the fused gate+up+down FFN through the chunked
-    # work-stealing scheduler (parallelForSteal2) instead of the static slabs.
-    set(SIMD_MATMUL_AVX2_FLAGS "${SIMD_MATMUL_AVX2_FLAGS} -DTINYCODER_USE_FFN_STEAL")
-    # Work-stealing chunk size (tiles) for both phases of the fused FFN.
-    set(SIMD_MATMUL_AVX2_FLAGS "${SIMD_MATMUL_AVX2_FLAGS} -DTINYCODER_STEAL_CHUNK=${TINYCODER_STEAL_CHUNK}")
-endif()
-if(TINYCODER_COOP_QUANTIZE)
-    # O1 cooperative quantize A/B: define TINYCODER_USE_COOP_QUANTIZE so the
-    # fused FFN's act→Q8_K quantize runs inline in phase-1 workers via the
-    # last-arriver counters (llama.cpp from_float) instead of the serial
-    # main-thread `between` callback.
-    set(SIMD_MATMUL_AVX2_FLAGS "${SIMD_MATMUL_AVX2_FLAGS} -DTINYCODER_USE_COOP_QUANTIZE")
-endif()
-if(SIMD_MATMUL_AVX2_FLAGS)
-    set_source_files_properties(
-        src/cpp/core/SIMDMatMulVecAVX2.cpp
-        PROPERTIES
-        COMPILE_FLAGS "${SIMD_MATMUL_AVX2_FLAGS}"
-    )
-endif()
-
-# The sampling pipeline (temperature/top-K/top-P softmax filtering + the
-# cumulative-scan draw) runs a full-vocab pass a few times per token; give it
-# the same AVX2/FMA flags as the SIMD kernel TU (guarded by __AVX2__/__FMA__
-# inside the source, so it degrades to scalar otherwise).
-set(SAMPLING_AVX2_FLAGS "")
-if(ENABLE_AVX2)
-    set(SAMPLING_AVX2_FLAGS "${SAMPLING_AVX2_FLAGS} -mavx2 -mfma")
-endif()
-if(SAMPLING_AVX2_FLAGS)
-    set_source_files_properties(
-        src/cpp/core/ModelSampling.cpp
-        PROPERTIES
-        COMPILE_FLAGS "${SAMPLING_AVX2_FLAGS}"
-    )
-endif()
-
-# AVX-512 is not supported on this CPU, so these flags are disabled by default.
-# Enable ENABLE_AVX512 to compile the AVX-512 kernels. -mavx512bw is required for
-# the byte/word intrinsics (_mm512_maddubs_epi16, _mm512_madd_epi16) used by the
-# Q8_K and pre-packed Q2_K kernels.
-set(SIMD_MATMUL_AVX512_FLAGS "")
-if(ENABLE_AVX512)
-    set(SIMD_MATMUL_AVX512_FLAGS "${SIMD_MATMUL_AVX512_FLAGS} -mavx512f -mavx512bw -mfma")
-endif()
-if(SIMD_MATMUL_AVX512_FLAGS)
-    set_source_files_properties(
-        src/cpp/core/SIMDMatMulVecAVX512.cpp
-        PROPERTIES
-        COMPILE_FLAGS "${SIMD_MATMUL_AVX512_FLAGS}"
-    )
-endif()
-
-# Build the engine core once; tests and the addon both link this target.
-add_library(tinycoder_core STATIC ${TINYCODER_CORE_SOURCES})
-
-target_include_directories(tinycoder_core
-    PUBLIC
-    ${CMAKE_SOURCE_DIR}/include
-    ${np_SOURCE_DIR}/include
-)
-
-target_link_libraries(tinycoder_core
-    PUBLIC
-    np
-)
-
-set_target_properties(tinycoder_core PROPERTIES
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-)
-
-# Compile-time configuration for the thread pool + fused FFN:
-#   TINYCODER_AFFINITY   - 1 pins workers to distinct physical cores, 0 lets the
-#                          OS schedule on all logical CPUs (default; faster at
-#                          low thread counts on memory-bound generation).
-#   TINYCODER_STEAL_CHUNK - work-stealing chunk size (tiles) for the fused FFN.
-target_compile_definitions(tinycoder_core PRIVATE
-    TINYCODER_AFFINITY=$<IF:$<BOOL:${TINYCODER_AFFINITY}>,1,0>
-    TINYCODER_STEAL_CHUNK=${TINYCODER_STEAL_CHUNK}
-)
-# CUDA configuration for the core library
-if(ENABLE_CUDA)
-    target_compile_definitions(tinycoder_core PUBLIC USE_CUDA)
-    set_target_properties(tinycoder_core PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-    )
-    find_library(CUBLAS_LIBRARY cublas)
-    if(CUBLAS_LIBRARY)
-        target_link_libraries(tinycoder_core PRIVATE ${CUBLAS_LIBRARY})
-        target_compile_definitions(tinycoder_core PRIVATE USE_CUBLAS)
-        message(STATUS "cuBLAS found: ${CUBLAS_LIBRARY}")
-    else()
-        message(WARNING "cuBLAS not found — LM head CUDA acceleration disabled")
-    endif()
-endif()
-
 # ---- Build the native addon ----
 # The addon is a thin N-API module: it only compiles the bridge and links the
-# engine core (tinycoder_core) instead of re-compiling all engine sources.
+# engine core (tinycoder_core) from the fetched tinycoder-inference repository.
+# The engine sources are NOT compiled in this tree anymore.
 add_library(tinycoder_native MODULE
     ${CMAKE_SOURCE_DIR}/src/cpp/bridge/Bridge.cpp
 )
@@ -289,12 +167,10 @@ target_include_directories(tinycoder_native PRIVATE
     ${NODE_API_HEADER_DIR}
 )
 
-# Link the engine core and its dependencies (np, CUDA, cuBLAS)
+# Link the engine core and its dependencies (np, CUDA, cuBLAS). The np library
+# is fetched and built by the inference engine's own CMakeLists.txt; the addon
+# receives it transitively through tinycoder_core's PUBLIC link.
 target_link_libraries(tinycoder_native PRIVATE tinycoder_core)
-
-# Note: OpenMP is no longer used directly by TinyCoder.
-# The np library may still be built with OpenMP via its own CMake configuration.
-# ENABLE_OPENMP option is forwarded to np's FetchContent for that purpose.
 
 # Set output properties for Node.js native addon
 set_target_properties(tinycoder_native PROPERTIES
@@ -314,20 +190,13 @@ elseif(WIN32)
     )
 endif()
 
-# ---- Unit Tests (Google Test) ----
-option(BUILD_TESTS "Build unit tests" ON)
-
-if(BUILD_TESTS)
-    add_subdirectory(unit_tests)
-    # llama-bench-parity warm generation benchmark (benchmarks/BenchMain.cpp).
-    # Kept intentionally OUT of unit_tests/: it is a measurement harness, not a
-    # parity/correctness test — it would add a gtest-incompatible generate loop.
-    add_subdirectory(benchmarks)
-endif()
+# ---- Unit tests & benchmarks ----
+# The unit tests (unit_tests/, Google Test) and the llama-bench-parity benchmark
+# harness (benchmarks/) moved to the tinycoder-inference repository together
+# with the engine. Build and run them there (BUILD_TESTS=ON), not here.
 
 # ---- Install ----
 install(TARGETS tinycoder_native DESTINATION native)
-install(FILES ${TINYCODER_HEADERS} DESTINATION include/tinycoder)
 
 # ---- Print configuration summary ----
 message(STATUS "")
@@ -338,6 +207,6 @@ message(STATUS "  AMX:           ${ENABLE_AMX}")
 message(STATUS "  OpenMP:        ${ENABLE_OPENMP}")
 message(STATUS "  CUDA:          ${ENABLE_CUDA}")
 message(STATUS "  C++ Standard:  ${CMAKE_CXX_STANDARD}")
-message(STATUS "  np library:    ${np_SOURCE_DIR}")
+message(STATUS "  Engine core:   ${tinycoder_inference_SOURCE_DIR}")
 message(STATUS "  Output:        ${CMAKE_BINARY_DIR}/Release/tinycoder_native.node")
 message(STATUS "")
