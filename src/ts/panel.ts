@@ -39,6 +39,8 @@ import {
     getNativeAddonStatus,
     HardwareInfo
 } from './nativeBridge';
+import { runAgentTask } from './agent/runner';
+import { AgentEvent } from './agent/types';
 
 interface PanelMessage {
     type: string;
@@ -174,7 +176,12 @@ export class TinyCoderPanel {
                 break;
 
             case 'chat':
-                await this.handleChat(message.content, message.params);
+                // `params.agent` is set by the webview when Agent mode is on.
+                await this.handleChat(message.content, message.params as any);
+                break;
+
+            case 'openAgentOptions':
+                await vscode.commands.executeCommand('tinycoder.openAgentOptions');
                 break;
 
             case 'stopGeneration':
@@ -325,7 +332,12 @@ export class TinyCoderPanel {
     /**
      * Handle a chat message.
      */
-    private async handleChat(content: string, params?: InferenceParams): Promise<void> {
+    private async handleChat(content: string, params?: InferenceParams & { agent?: boolean }): Promise<void> {
+        if (params?.agent) {
+            await this.handleAgentChat(content);
+            return;
+        }
+
         if (!isModelLoaded()) {
             this.sendMessage({
                 type: 'error',
@@ -381,6 +393,75 @@ export class TinyCoderPanel {
             });
         } finally {
             this.isGenerating = false;
+        }
+    }
+
+    /**
+     * Route a chat message to the autonomous ReAct agent.
+     * Streams tool progress and the final answer as webview messages.
+     */
+    private async handleAgentChat(content: string): Promise<void> {
+        if (this.isGenerating) {
+            return;
+        }
+        this.isGenerating = true;
+        this.sendMessage({ type: 'agentStart' });
+
+        const onAgentEvent = (event: AgentEvent): void => {
+            switch (event.type) {
+                case 'iteration':
+                    this.sendMessage({
+                        type: 'agentIteration',
+                        iteration: event.iteration,
+                        maxIterations: event.maxIterations
+                    });
+                    break;
+                case 'toolCall':
+                    this.sendMessage({
+                        type: 'agentTool',
+                        name: event.call.name,
+                        args: JSON.stringify(event.call.arguments)
+                    });
+                    break;
+                case 'toolResult':
+                    this.sendMessage({
+                        type: 'agentToolResult',
+                        name: event.result.name,
+                        ok: event.result.ok,
+                        output: event.result.output.slice(0, 4000),
+                        durationMs: event.result.durationMs
+                    });
+                    break;
+                case 'compaction':
+                    this.sendMessage({
+                        type: 'agentCompaction',
+                        removed: event.removed,
+                        remaining: event.remaining
+                    });
+                    break;
+                case 'final':
+                    this.sendMessage({ type: 'agentFinal', text: event.text });
+                    break;
+                case 'error':
+                    this.sendMessage({ type: 'error', message: event.message });
+                    break;
+            }
+        };
+
+        try {
+            const finalAnswer = await runAgentTask(content, onAgentEvent);
+            // If no onEvent fired a final (e.g. early abort), still surface the text.
+            if (finalAnswer) {
+                this.sendMessage({ type: 'agentFinal', text: finalAnswer });
+            }
+        } catch (err: any) {
+            this.sendMessage({
+                type: 'error',
+                message: `Agent error: ${err?.message || err}`
+            });
+        } finally {
+            this.isGenerating = false;
+            this.sendMessage({ type: 'agentDone' });
         }
     }
 
@@ -696,6 +777,54 @@ ${userMessage}<|im_end|>
             margin-top: 4px;
         }
 
+        /* Agent status pill */
+        .agent-status {
+            align-self: center;
+            max-width: 100%;
+            width: 100%;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 8px 12px;
+            font-size: 12px;
+            margin: 4px 0;
+        }
+        .agent-status-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--accent);
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .agent-spin {
+            display: inline-block;
+            animation: spin 1.2s linear infinite;
+        }
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+        .agent-tool-head {
+            font-size: 11px;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            color: var(--accent);
+        }
+        .agent-tool-head.ok { color: var(--success); }
+        .agent-tool-head.err { color: var(--error); }
+        .agent-tool-out {
+            background: var(--code-bg);
+            border-radius: 6px;
+            padding: 6px 8px;
+            margin-top: 4px;
+            font-size: 11px;
+            max-height: 160px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        }
+
         /* Input Area */
         .input-area {
             padding: 12px 16px;
@@ -799,6 +928,16 @@ ${userMessage}<|im_end|>
             <span class="status-indicator not-loaded" id="statusIndicator"></span>
         </div>
         <div class="header-actions">
+            <button id="agentToggleBtn" onclick="toggleAgentMode()"
+                    style="padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);cursor:pointer;font-size:12px;"
+                    title="Toggle autonomous Agent mode">
+                🤖 Agent OFF
+            </button>
+            <button id="optionsBtn" onclick="openAgentOptions()"
+                    style="padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);cursor:pointer;font-size:12px;"
+                    title="Open TinyCoder Agent Options (model, inference, agent settings)">
+                ⚙️ Options
+            </button>
             <button onclick="loadModelDialog()" style="padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);cursor:pointer;font-size:12px;">
                 📂 Load Model
             </button>
@@ -855,6 +994,85 @@ ${userMessage}<|im_end|>
         const vscode = acquireVsCodeApi();
         let isGenerating = false;
         let currentAssistantMsg = null;
+        let agentMode = false;
+        let agentStatusEl = null;
+
+        // ---------- State persistence ----------
+        // The webview is destroyed when the extension view is hidden; keep the
+        // conversation + mode in VS Code's per-webview state so it restores.
+        const webviewState = vscode.getState() || { messages: [], agentMode: false };
+
+        function persistState() {
+            const messagesEl = document.getElementById('messages');
+            if (!messagesEl) return;
+            const entries = [];
+            for (const el of messagesEl.children) {
+                if (!el.dataset) continue;
+                if (el.dataset.role) {
+                    entries.push({
+                        role: el.dataset.role,
+                        text: el.innerText,
+                        code: el.innerHTML
+                    });
+                }
+            }
+            webviewState.messages = entries;
+            webviewState.agentMode = agentMode;
+            vscode.setState(webviewState);
+        }
+
+        function restoreState() {
+            const messagesEl = document.getElementById('messages');
+            if (!messagesEl) return;
+            // Remove the static welcome message when there is saved history.
+            const welcome = document.getElementById('welcomeMessage');
+            if (welcome && webviewState.messages && webviewState.messages.length > 0) {
+                welcome.remove();
+            }
+            for (const entry of (webviewState.messages || [])) {
+                const div = document.createElement('div');
+                div.className = 'message ' + entry.role;
+                if (entry.role === 'user' || entry.role === 'system' || entry.role === 'error') {
+                    div.textContent = entry.text;
+                } else {
+                    div.innerHTML = entry.code || escapeHtml(entry.text);
+                }
+                messagesEl.appendChild(div);
+            }
+            if (webviewState.agentMode) {
+                setAgentMode(true);
+            }
+            scrollToBottom();
+        }
+
+        function setAgentMode(on) {
+            agentMode = on;
+            const btn = document.getElementById('agentToggleBtn');
+            if (btn) {
+                btn.textContent = agentMode ? '🤖 Agent ON' : '🤖 Agent OFF';
+                btn.style.background = agentMode ? 'var(--accent)' : 'var(--bg-tertiary)';
+                btn.style.color = agentMode ? '#11111b' : 'var(--text-primary)';
+            }
+            const input = document.getElementById('input');
+            if (input) {
+                input.placeholder = agentMode
+                    ? 'Agent task (tools: read/write/patch/search/terminal)...'
+                    : 'Ask TinyCoder to write, explain, or debug code...';
+            }
+        }
+
+        function toggleAgentMode() {
+            setAgentMode(!agentMode);
+            addSystemMessage(agentMode ? '🤖 Agent mode ON — messages run the autonomous ReAct agent.' : '💬 Chat mode ON — plain chat generation.');
+            persistState();
+        }
+
+        function openAgentOptions() {
+            vscode.postMessage({ type: 'openAgentOptions' });
+        }
+
+        // Restore persisted conversation + agent mode once the DOM is ready.
+        restoreState();
 
         // Notify extension that panel is ready
         vscode.postMessage({ type: 'ready' });
@@ -872,6 +1090,52 @@ ${userMessage}<|im_end|>
                 case 'generationComplete':
                     isGenerating = false;
                     updateSendButton();
+                    persistState();
+                    break;
+
+                // ---- Agent events ----
+                case 'agentStart':
+                    addSystemMessage('🤖 Starting agent…');
+                    break;
+
+                case 'agentIteration':
+                    ensureAgentStatus();
+                    updateAgentStatus('iteration ' + msg.iteration + '/' + msg.maxIterations);
+                    break;
+
+                case 'agentTool':
+                    ensureAgentStatus();
+                    updateAgentStatus('⚙ ' + msg.name + '(' + msg.args + ')');
+                    addSystemMessage('⚙ Tool: ' + msg.name + ' — ' + msg.args);
+                    break;
+
+                case 'agentToolResult': {
+                    ensureAgentStatus();
+                    const titleEl = document.getElementById('agentToolTitle');
+                    if (titleEl) {
+                        titleEl.textContent = (msg.ok ? '✓ ' : '✗ ') + msg.name + ' (' + msg.durationMs + 'ms)';
+                        titleEl.className = msg.ok ? 'agent-tool-head ok' : 'agent-tool-head err';
+                    }
+                    const outEl = document.getElementById('agentToolOut');
+                    if (outEl) {
+                        outEl.textContent = msg.output || '(no output)';
+                    }
+                    break;
+                }
+
+                case 'agentFinal':
+                    hideAgentStatus();
+                    finalizeAgentMessage(msg.text);
+                    break;
+
+                case 'agentCompaction':
+                    addSystemMessage('🧹 Context compacted: removed ' + msg.removed + ' old messages, ' + msg.remaining + ' remain');
+                    break;
+
+                case 'agentDone':
+                    isGenerating = false;
+                    updateSendButton();
+                    persistState();
                     break;
 
                 case 'loadProgress':
@@ -920,14 +1184,122 @@ ${userMessage}<|im_end|>
             }
         });
 
+        // Throttle DOM-state persisting during streaming.
+        let lastPersist = 0;
+        function throttlePersist() {
+            const now = Date.now();
+            if (now - lastPersist > 1000) {
+                lastPersist = now;
+                persistState();
+            }
+        }
+
         function handleToken(msg) {
             if (!currentAssistantMsg) {
                 currentAssistantMsg = addAssistantMessage('');
             }
             if (currentAssistantMsg) {
-                currentAssistantMsg.innerHTML += escapeHtml(msg.text);
+                // Strip <thinking> blocks (empty in chat) and accumulate,
+                // rendering markdown on the fly.
+                const cleaned = stripThinking(msg.text);
+                if (cleaned) {
+                    currentAssistantMsg.dataset.raw = (currentAssistantMsg.dataset.raw || '') + cleaned;
+                    currentAssistantMsg.innerHTML = renderMarkdown(currentAssistantMsg.dataset.raw);
+                    throttlePersist();
+                }
                 scrollToBottom();
             }
+        }
+
+        // ---------- Agent status pills ----------
+        function ensureAgentStatus() {
+            if (agentStatusEl) return;
+            const messages = document.getElementById('messages');
+            if (!messages) return;
+            agentStatusEl = document.createElement('div');
+            agentStatusEl.className = 'agent-status';
+            agentStatusEl.innerHTML =
+                '<div class="agent-status-row"><span id="agentToolTitle" class="agent-tool-head">…</span>' +
+                '</div><pre id="agentToolOut" class="agent-tool-out"></pre>';
+            messages.appendChild(agentStatusEl);
+            scrollToBottom();
+        }
+
+        function updateAgentStatus(text) {
+            if (agentStatusEl) {
+                const head = agentStatusEl.querySelector('.agent-status-row');
+                if (head) {
+                    head.innerHTML = '<span class="agent-spin">⏳</span> ' + escapeHtml(text);
+                }
+            }
+            scrollToBottom();
+        }
+
+        function hideAgentStatus() {
+            if (agentStatusEl) {
+                agentStatusEl.remove();
+                agentStatusEl = null;
+            }
+        }
+
+        // ---------- Markdown / thinking ----------
+        function stripThinking(text) {
+            if (!text) return '';
+            // Remove <thinking>...</thinking> and <reasoning>...</reasoning> blocks.
+            const BT = String.fromCharCode(96); // backtick
+            const fence = BT + BT + BT;
+            return text
+                .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+                .replace(new RegExp(fence + '\\s*thinking[\\s\\S]*?' + fence, 'gi'), '')
+                .replace(/^\s*<reasoning>[\s\S]*?<\/reasoning>\s*/gi, '');
+        }
+
+        function escapeHtml(t) {
+            const d = document.createElement('div');
+            d.textContent = t;
+            return d.innerHTML;
+        }
+
+        function renderMarkdown(text) {
+            if (!text) return '';
+            let t = escapeHtml(text);
+            const BT = String.fromCharCode(96); // backtick
+            const fence = BT + BT + BT;
+            // inline code
+            t = t.replace(new RegExp(BT + '([^' + BT + ']+)' + BT, 'g'), '<code>$1</code>');
+            // bold
+            t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+            // italic
+            t = t.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+            // headings
+            t = t.replace(/^#{1,6}\s+(.*)$/gm, '<h4>$1</h4>');
+            // bullet lists
+            t = t.replace(/^\s*[-*]\s+(.*)$/gm, '<li>$1</li>');
+            t = t.replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>');
+            // fenced code blocks (triple-backtick lang ... triple-backtick)
+            t = t.replace(new RegExp(fence + '(\\w*)\\n([\\s\\S]*?)' + fence, 'g'), function (_, lang, code) {
+                return '<pre class="code-block" data-lang="' + (lang || 'code') + '">' + code + '</pre>';
+            });
+            // line breaks
+            t = t.replace(/\n/g, '<br>');
+            return t;
+        }
+
+        function finalizeAgentMessage(text) {
+            const cleaned = stripThinking(text).trim();
+            if (!cleaned) {
+                addSystemMessage('✅ Agent finished.');
+                return;
+            }
+            const div = document.createElement('div');
+            div.className = 'message assistant';
+            div.dataset.role = 'assistant';
+            div.innerHTML = renderMarkdown(cleaned);
+            const messages = document.getElementById('messages');
+            if (messages) {
+                messages.appendChild(div);
+            }
+            scrollToBottom();
         }
 
         function updateProgress(progress, stage) {
@@ -1000,10 +1372,13 @@ ${userMessage}<|im_end|>
             isGenerating = true;
             updateSendButton();
 
+            // Route to the ReAct agent when Agent mode is on.
             vscode.postMessage({
                 type: 'chat',
-                content: content
+                content: content,
+                params: { agent: agentMode }
             });
+            persistState();
         }
 
         function handleKeyDown(event) {
@@ -1015,11 +1390,6 @@ ${userMessage}<|im_end|>
 
         function autoResize(textarea) {
             if (!textarea) return;
-            textarea.style.height = 'auto';
-            textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
-        }
-
-        function autoResize(textarea) {
             textarea.style.height = 'auto';
             textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
         }
@@ -1054,6 +1424,7 @@ ${userMessage}<|im_end|>
             if (!messages) return;
             const div = document.createElement('div');
             div.className = 'message user';
+            div.dataset.role = 'user';
             div.textContent = text;
             messages.appendChild(div);
             scrollToBottom();
@@ -1064,6 +1435,7 @@ ${userMessage}<|im_end|>
             if (!messages) return null;
             const div = document.createElement('div');
             div.className = 'message assistant';
+            div.dataset.role = 'assistant';
             div.innerHTML = text;
             messages.appendChild(div);
             scrollToBottom();
@@ -1075,6 +1447,7 @@ ${userMessage}<|im_end|>
             if (!messages) return;
             const div = document.createElement('div');
             div.className = 'message system';
+            div.dataset.role = 'system';
             div.textContent = text;
             messages.appendChild(div);
             scrollToBottom();
@@ -1085,6 +1458,7 @@ ${userMessage}<|im_end|>
             if (!messages) return;
             const div = document.createElement('div');
             div.className = 'message error';
+            div.dataset.role = 'error';
             div.textContent = text;
             messages.appendChild(div);
             scrollToBottom();
