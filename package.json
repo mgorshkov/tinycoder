@@ -2,7 +2,7 @@
   "name": "tinycoder",
   "displayName": "TinyCoder AI",
   "description": "Local AI coding assistant powered by Qwen2.5-Coder, Gemma 4, and Qwen3.6 GGUF models. Native C++ inference with AVX2/AVX-512/AMX SIMD acceleration and CUDA GPU support. Runs entirely offline on limited resources.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "tinycoder",
   "license": "MIT",
   "repository": {
@@ -53,7 +53,10 @@
     "onCommand:tinycoder.generateCode",
     "onCommand:tinycoder.loadModel",
     "onCommand:tinycoder.showStatus",
-    "onCommand:tinycoder.inferFromTerminal"
+    "onCommand:tinycoder.inferFromTerminal",
+    "onCommand:tinycoder.agentRun",
+    "onCommand:tinycoder.openAgentOptions",
+    "onCommand:tinycoder.openSettings"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -72,6 +75,20 @@
           "type": "webview",
           "id": "tinycoder.chat",
           "name": "Chat"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "tinycoder.openAgentOptions",
+          "when": "view == tinycoder.chat",
+          "group": "navigation"
+        },
+        {
+          "command": "tinycoder.openSettings",
+          "when": "view == tinycoder.chat",
+          "group": "navigation@1"
         }
       ]
     },
@@ -103,6 +120,20 @@
       {
         "command": "tinycoder.inferFromTerminal",
         "title": "TinyCoder: Infer from Terminal Selection"
+      },
+      {
+        "command": "tinycoder.agentRun",
+        "title": "TinyCoder: Run Agent (Autonomous Coding)"
+      },
+      {
+        "command": "tinycoder.openAgentOptions",
+        "title": "TinyCoder: Open Agent Options",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "tinycoder.openSettings",
+        "title": "TinyCoder: Open Settings",
+        "icon": "$(settings-gear)"
       }
     ],
     "keybindings": [
@@ -127,7 +158,7 @@
       "properties": {
         "tinycoder.modelPath": {
           "type": "string",
-          "default": "",
+          "default": "/data/models/qwen/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
           "description": "Path to the GGUF model file"
         },
         "tinycoder.nThreads": {
@@ -185,6 +216,73 @@
           "minimum": 0,
           "maximum": 1024,
           "description": "Number of recent tokens to consider for repetition penalty"
+        },
+        "tinycoder.agent.maxIterations": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Maximum ReAct loop iterations (tool calls + follow-ups) before forcing a final answer"
+        },
+        "tinycoder.agent.compactionThreshold": {
+          "type": "number",
+          "default": 24,
+          "minimum": 4,
+          "maximum": 1000,
+          "description": "History depth (messages) at which older tool results are truncated for context management"
+        },
+        "tinycoder.agent.compactionPreserveRecent": {
+          "type": "number",
+          "default": 8,
+          "minimum": 0,
+          "maximum": 200,
+          "description": "How many of the most recent messages to keep verbatim during compaction"
+        },
+        "tinycoder.agent.workspaceRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Root directory the agent may operate on. Empty = first workspace folder"
+        },
+        "tinycoder.agent.terminalName": {
+          "type": "string",
+          "default": "TinyCoder Agent",
+          "description": "Name of the VS Code terminal used for runTerminalCommand"
+        },
+        "tinycoder.agent.terminalMode": {
+          "type": "string",
+          "default": "vscode",
+          "enum": ["vscode", "child", "auto"],
+          "description": "vscode: createTerminal + output capture. child: shell subprocess (deterministic capture). auto: try vscode, fall back to child"
+        },
+        "tinycoder.agent.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "Optional base system prompt override. The tool protocol is always appended"
+        },
+        "tinycoder.agent.enableReadFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expose the readFile tool to the agent"
+        },
+        "tinycoder.agent.enableWriteFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expose the writeFile tool to the agent"
+        },
+        "tinycoder.agent.enablePatchFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expose the patchFile tool to the agent"
+        },
+        "tinycoder.agent.enableTerminal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expose the executeTerminalCommand tool to the agent"
+        },
+        "tinycoder.agent.enableSearch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expose the searchCodebase tool to the agent"
         }
       }
     }
@@ -199,7 +297,8 @@
     "build:native:cuda": "cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON && cmake --build build --config Release",
     "lint": "eslint src --ext ts",
     "pretest": "npm run compile",
-    "test": "node ./out/test/runTest.js"
+    "test": "node ./out/test/runTest.js",
+    "test:agent": "npm run compile && node tests/agentSmoke.test.js && node tests/agentLoop.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
