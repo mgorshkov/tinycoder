@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TinyCoder AI — Ultra-fast local AI coding agent for VS Code</title>
+<meta name="description" content="TinyCoder AI is an ultra-fast, fully offline local AI coding agent for VS Code. Native C++ inference with Qwen2.5-Coder, Gemma 4 and Qwen3.6 GGUF models, mixed quantization, SIMD (AMX/AVX-512/AVX2) and CUDA GPU acceleration." />
+<link rel="icon" href="media/icon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg-0: #05060f;
+    --bg-1: #0a0d1e;
+    --bg-2: #11152e;
+    --panel: rgba(255, 255, 255, 0.04);
+    --panel-border: rgba(255, 255, 255, 0.09);
+    --text-0: #f2f5ff;
+    --text-1: #aeb6d4;
+    --text-2: #6f789c;
+    --accent: #38f2d2;
+    --accent-2: #ff8a3d;
+    --blue: #5b8cff;
+    --purple: #b18cff;
+    --grad: linear-gradient(135deg, var(--accent) 0%, var(--blue) 45%, var(--purple) 100%);
+    --radius: 18px;
+    --maxw: 1120px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg-0);
+    color: var(--text-0);
+    line-height: 1.6;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection { background: rgba(56, 242, 210, 0.28); color: #fff; }
+
+  /* ---------- ambient background ---------- */
+  .bg {
+    position: fixed;
+    inset: 0;
+    z-index: -2;
+    background:
+      radial-gradient(1100px 700px at 12% -8%, rgba(56, 242, 210, 0.12), transparent 60%),
+      radial-gradient(1000px 800px at 88% -10%, rgba(91, 140, 255, 0.14), transparent 60%),
+      radial-gradient(900px 700px at 50% 115%, rgba(177, 140, 255, 0.10), transparent 60%),
+      linear-gradient(180deg, var(--bg-1), var(--bg-0) 55%);
+  }
+
+  .grid-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+    background-size: 52px 52px;
+    mask-image: radial-gradient(ellipse 90% 65% at 50% 0%, #000 25%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse 90% 65% at 50% 0%, #000 25%, transparent 75%);
+  }
+
+  .aurora {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    filter: blur(90px);
+    opacity: 0.5;
+    pointer-events: none;
+  }
+  .aurora::before,
+  .aurora::after {
+    content: "";
+    position: absolute;
+    width: 45vw;
+    height: 45vw;
+    border-radius: 50%;
+    animation: drift 22s ease-in-out infinite alternate;
+  }
+  .aurora::before {
+    left: -12vw;
+    top: 5vh;
+    background: radial-gradient(circle, rgba(56, 242, 210, 0.16), transparent 65%);
+  }
+  .aurora::after {
+    right: -14vw;
+    top: 30vh;
+    background: radial-gradient(circle, rgba(91, 140, 255, 0.18), transparent 65%);
+    animation-delay: -11s;
+  }
+  @keyframes drift {
+    from { transform: translate3d(0, 0, 0) scale(1); }
+    to   { transform: translate3d(4vw, -3vh, 0) scale(1.12); }
+  }
+
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 28px; }
+
+  /* ---------- navigation ---------- */
+  nav {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    background: rgba(5, 6, 15, 0.62);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  nav .wrap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 68px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    text-decoration: none;
+    color: var(--text-0);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+  .brand-logo {
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    object-fit: cover;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.14), 0 8px 24px rgba(56, 242, 210, 0.25);
+  }
+  .brand b { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  nav a.gh-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    color: var(--text-1);
+    font-weight: 600;
+    font-size: 14px;
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+    padding: 9px 16px;
+    border-radius: 999px;
+    transition: border-color .2s, color .2s, transform .2s, box-shadow .2s;
+  }
+  nav a.gh-link:hover {
+    color: #fff;
+    border-color: rgba(56, 242, 210, 0.55);
+    transform: translateY(-1px);
+    box-shadow: 0 8px 24px rgba(56, 242, 210, 0.18);
+  }
+  nav a.gh-link svg { width: 17px; height: 17px; }
+
+  /* ---------- hero ---------- */
+  header.hero { padding: 96px 0 64px; text-align: center; }
+  .hero-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid rgba(56, 242, 210, 0.35);
+    background: rgba(56, 242, 210, 0.08);
+    padding: 7px 16px;
+    border-radius: 999px;
+    margin-bottom: 34px;
+  }
+  .hero-badge .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 12px var(--accent);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+  .hero-logo-wrap {
+    position: relative;
+    display: inline-block;
+    margin-bottom: 30px;
+  }
+  .hero-logo {
+    width: 148px;
+    height: 148px;
+    border-radius: 32px;
+    object-fit: cover;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    box-shadow:
+      0 30px 70px rgba(0, 0, 0, 0.55),
+      0 0 0 8px rgba(56, 242, 210, 0.06),
+      0 0 90px rgba(56, 242, 210, 0.28);
+    animation: float 6s ease-in-out infinite;
+  }
+  .hero-logo-wrap::after {
+    content: "";
+    position: absolute;
+    inset: -34px;
+    z-index: -1;
+    background: radial-gradient(circle, rgba(56, 242, 210, 0.22), transparent 68%);
+  }
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-10px); }
+  }
+
+  h1 {
+    font-size: clamp(2.5rem, 6vw, 4.4rem);
+    font-weight: 800;
+    letter-spacing: -0.035em;
+    line-height: 1.06;
+    margin-bottom: 18px;
+    font-family: "Space Grotesk", "Inter", sans-serif;
+  }
+  h1 .grad {
+    background: var(--grad);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .hero-sub {
+    max-width: 680px;
+    margin: 0 auto 38px;
+    font-size: clamp(1rem, 1.6vw, 1.18rem);
+    color: var(--text-1);
+  }
+  .hero-sub strong { color: var(--text-0); }
+
+  .cta-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    text-decoration: none;
+    font-weight: 700;
+    font-size: 15px;
+    padding: 14px 28px;
+    border-radius: 999px;
+    transition: transform .2s, box-shadow .2s, background .2s, border-color .2s;
+  }
+  .btn-primary {
+    background: var(--grad);
+    color: #05060f;
+    box-shadow: 0 14px 40px rgba(56, 242, 210, 0.28);
+  }
+  .btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 18px 50px rgba(56, 242, 210, 0.4);
+  }
+  .btn-ghost {
+    color: var(--text-0);
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+  }
+  .btn-ghost:hover {
+    transform: translateY(-2px);
+    border-color: rgba(91, 140, 255, 0.55);
+    box-shadow: 0 12px 34px rgba(91, 140, 255, 0.2);
+  }
+  .btn svg { width: 18px; height: 18px; }
+
+  .hero-stats {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 52px;
+  }
+  .stat {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13px;
+    color: var(--text-1);
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    padding: 10px 18px;
+    border-radius: 12px;
+    backdrop-filter: blur(8px);
+  }
+  .stat b { color: var(--accent); font-weight: 600; }
+
+  /* ---------- sections ---------- */
+  section { padding: 76px 0; position: relative; }
+
+  .section-head { text-align: center; max-width: 720px; margin: 0 auto 52px; }
+  .section-head .kicker {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent-2);
+    margin-bottom: 12px;
+  }
+  .section-head h2 {
+    font-family: "Space Grotesk", "Inter", sans-serif;
+    font-size: clamp(1.8rem, 3.4vw, 2.6rem);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.15;
+    margin-bottom: 14px;
+  }
+  .section-head p { color: var(--text-1); font-size: 1.02rem; }
+
+  /* ---------- features ---------- */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 22px;
+  }
+  .card {
+    background: linear-gradient(160deg, rgba(255,255,255,0.055), rgba(255,255,255,0.02));
+    border: 1px solid var(--panel-border);
+    border-radius: var(--radius);
+    padding: 28px 26px;
+    position: relative;
+    overflow: hidden;
+    transition: transform .25s, border-color .25s, box-shadow .25s;
+  }
+  .card::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--grad);
+    opacity: 0;
+    transition: opacity .25s;
+  }
+  .card:hover {
+    transform: translateY(-5px);
+    border-color: rgba(255, 255, 255, 0.18);
+    box-shadow: 0 24px 48px rgba(0, 0, 0, 0.4);
+  }
+  .card:hover::before { opacity: 1; }
+  .card .ico {
+    width: 46px; height: 46px;
+    display: grid;
+    place-items: center;
+    border-radius: 13px;
+    background: rgba(56, 242, 210, 0.1);
+    border: 1px solid rgba(56, 242, 210, 0.25);
+    color: var(--accent);
+    margin-bottom: 18px;
+    font-size: 21px;
+  }
+  .card h3 { font-size: 1.08rem; font-weight: 700; margin-bottom: 9px; letter-spacing: -0.01em; }
+  .card p { color: var(--text-1); font-size: 0.93rem; }
+  .card .tags { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
+  .tag {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    color: var(--blue);
+    background: rgba(91, 140, 255, 0.1);
+    border: 1px solid rgba(91, 140, 255, 0.22);
+    padding: 4px 10px;
+    border-radius: 7px;
+  }
+  .tag.g { color: var(--accent); border-color: rgba(56,242,210,.25); background: rgba(56,242,210,.08); }
+  .tag.p { color: var(--purple); border-color: rgba(177,140,255,.25); background: rgba(177,140,255,.08); }
+
+  /* ---------- architecture banner ---------- */
+  .pipeline {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px;
+    margin-top: 14px;
+  }
+  .pipe-step {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 14px;
+    padding: 18px 16px;
+    text-align: center;
+    position: relative;
+    font-size: 0.86rem;
+    color: var(--text-1);
+  }
+  .pipe-step b { display: block; font-size: .95rem; color: var(--text-0); margin-bottom: 4px; font-family: "JetBrains Mono", monospace; }
+  .pipe-step:not(:last-child)::after {
+    content: "→";
+    position: absolute;
+    right: -13px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--accent);
+    font-size: 16px;
+    z-index: 2;
+  }
+  .pipe-step .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-bottom: 8px; }
+
+  /* ---------- models ---------- */
+  .models {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 22px;
+  }
+  .model-card {
+    background: linear-gradient(160deg, rgba(255,255,255,0.05), rgba(255,255,255,0.015));
+    border: 1px solid var(--panel-border);
+    border-radius: var(--radius);
+    padding: 26px;
+    transition: transform .25s, border-color .25s;
+  }
+  .model-card:hover { transform: translateY(-4px); border-color: rgba(56,242,210,.3); }
+  .model-card .m-name {
+    font-family: "JetBrains Mono", monospace;
+    font-weight: 600;
+    font-size: 1rem;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .model-card .m-name .chip {
+    font-size: 10px;
+    font-family: "Inter", sans-serif;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: rgba(177, 140, 255, 0.14);
+    color: var(--purple);
+    border: 1px solid rgba(177,140,255,.3);
+    font-weight: 700;
+  }
+  .model-card ul { list-style: none; }
+  .model-card ul li {
+    font-size: 0.86rem;
+    color: var(--text-1);
+    padding: 7px 0;
+    border-bottom: 1px dashed rgba(255,255,255,0.06);
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .model-card ul li:last-child { border-bottom: none; }
+  .model-card ul li span b { color: var(--text-0); font-weight: 600; }
+  .model-card ul li samp { font-family: "JetBrains Mono", monospace; color: var(--accent); font-size: 0.8rem; white-space: nowrap; }
+
+  /* ---------- quantization ---------- */
+  .quant-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 12px;
+  }
+  .q-chip {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 12px;
+    padding: 14px 12px;
+    text-align: center;
+    font-family: "JetBrains Mono", monospace;
+    transition: transform .2s, border-color .2s;
+  }
+  .q-chip:hover { transform: translateY(-3px); border-color: rgba(56,242,210,.4); }
+  .q-chip .q-name { font-weight: 700; font-size: .92rem; color: var(--text-0); }
+  .q-chip .q-bits { font-size: .74rem; color: var(--accent); margin-top: 3px; }
+
+  /* ---------- CTA ---------- */
+  .cta-panel {
+    position: relative;
+    overflow: hidden;
+    border-radius: 26px;
+    border: 1px solid rgba(56, 242, 210, 0.22);
+    background:
+      radial-gradient(600px 300px at 20% 0%, rgba(56, 242, 210, 0.14), transparent 60%),
+      radial-gradient(600px 320px at 85% 100%, rgba(91, 140, 255, 0.16), transparent 60%),
+      rgba(10, 13, 30, 0.8);
+    padding: 64px 40px;
+    text-align: center;
+    backdrop-filter: blur(10px);
+  }
+  .cta-panel h2 {
+    font-family: "Space Grotesk", "Inter", sans-serif;
+    font-size: clamp(1.7rem, 3.2vw, 2.4rem);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 14px;
+  }
+  .cta-panel p { color: var(--text-1); max-width: 560px; margin: 0 auto 32px; }
+  .gh-big {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    background: #fff;
+    color: #0b0d1a;
+    font-weight: 800;
+    font-size: 1.02rem;
+    padding: 16px 34px;
+    border-radius: 999px;
+    text-decoration: none;
+    box-shadow: 0 16px 44px rgba(0, 0, 0, 0.45);
+    transition: transform .2s, box-shadow .2s;
+  }
+  .gh-big:hover { transform: translateY(-2px) scale(1.02); box-shadow: 0 22px 60px rgba(56,242,210,0.3); }
+  .gh-big svg { width: 22px; height: 22px; }
+
+  /* ---------- footer ---------- */
+  footer {
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 40px 0 48px;
+    text-align: center;
+  }
+  footer .wrap { display: flex; flex-direction: column; gap: 14px; align-items: center; }
+  footer .foot-logo { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--text-0); }
+  footer .foot-logo img { width: 26px; height: 26px; border-radius: 7px; object-fit: cover; }
+  footer p { color: var(--text-2); font-size: 0.86rem; }
+  footer a { color: var(--text-1); text-decoration: none; }
+  footer a:hover { color: var(--accent); }
+
+  /* ---------- reveal animation ---------- */
+  .reveal {
+    opacity: 0;
+    transform: translateY(26px);
+    transition: opacity .7s ease, transform .7s ease;
+  }
+  .reveal.visible { opacity: 1; transform: none; }
+
+  @media (max-width: 640px) {
+    header.hero { padding: 64px 0 44px; }
+    section { padding: 56px 0; }
+    .hero-logo { width: 120px; height: 120px; }
+    .pipeline { grid-template-columns: 1fr; }
+    .pipe-step:not(:last-child)::after { content: "↓"; right: auto; left: 50%; top: auto; bottom: -15px; transform: translateX(-50%); }
+    .cta-panel { padding: 48px 24px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="bg"></div>
+<div class="grid-overlay"></div>
+<div class="aurora"></div>
+
+<!-- ============ NAV ============ -->
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top">
+      <img class="brand-logo" src="media/tinycoder.jpg" alt="TinyCoder AI logo" />
+      <span>Tiny<b>Coder</b> AI</span>
+    </a>
+    <a class="gh-link" href="https://github.com/mgorshkov/tinycoder" target="_blank" rel="noopener noreferrer">
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.7 1.25 3.35.96.1-.75.4-1.25.72-1.54-2.55-.29-5.23-1.28-5.23-5.68 0-1.26.45-2.28 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.15 1.18a10.9 10.9 0 0 1 5.74 0c2.19-1.49 3.15-1.18 3.15-1.18.62 1.59.23 2.76.11 3.05.74.81 1.18 1.83 1.18 3.09 0 4.41-2.69 5.38-5.25 5.67.41.35.77 1.05.77 2.12 0 1.53-.01 2.76-.01 3.14 0 .31.21.68.8.56A11.52 11.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+      GitHub
+    </a>
+  </div>
+</nav>
+
+<!-- ============ HERO ============ -->
+<header class="hero" id="top">
+  <div class="wrap">
+    <div class="hero-badge"><span class="dot"></span> 100% offline · Native C++ inference</div>
+
+    <div class="hero-logo-wrap">
+      <img class="hero-logo" src="media/tinycoder.jpg" alt="TinyCoder AI — logo" />
+    </div>
+
+    <h1>Ultra-fast AI coding agent,<br />running <span class="grad">entirely on your machine</span></h1>
+
+    <p class="hero-sub">
+      <strong>TinyCoder AI</strong> is a local coding agent for <strong>VS Code</strong> powered by
+      <strong>Qwen2.5-Coder</strong>, <strong>Gemma 4</strong> and <strong>Qwen3.6</strong> GGUF models
+      with mixed quantization, <strong>AMX / AVX-512 / AVX2</strong> CPU acceleration and
+      <strong>CUDA GPU</strong> support — engineered to run fast on limited hardware.
+    </p>
+
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/mgorshkov/tinycoder" target="_blank" rel="noopener noreferrer">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.7 1.25 3.35.96.1-.75.4-1.25.72-1.54-2.55-.29-5.23-1.28-5.23-5.68 0-1.26.45-2.28 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.15 1.18a10.9 10.9 0 0 1 5.74 0c2.19-1.49 3.15-1.18 3.15-1.18.62 1.59.23 2.76.11 3.05.74.81 1.18 1.83 1.18 3.09 0 4.41-2.69 5.38-5.25 5.67.41.35.77 1.05.77 2.12 0 1.53-.01 2.76-.01 3.14 0 .31.21.68.8.56A11.52 11.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+        View on GitHub
+      </a>
+      <a class="btn btn-ghost" href="#features">
+        Explore features
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
+      </a>
+    </div>
+
+    <div class="hero-stats">
+      <div class="stat">⚡ <b>~0.6 GB</b> compact 1.5B mixed-quant</div>
+      <div class="stat">🚀 <b>132 tok/s</b> on consumer GPU</div>
+      <div class="stat">🧠 <b>12</b> GGML quantization types</div>
+      <div class="stat">🔒 <b>100%</b> private & offline</div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ FEATURES ============ -->
+<section id="features">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="kicker">Key features</div>
+      <h2>Built for speed. Built for your hardware.</h2>
+      <p>No cloud, no API keys, no telemetry — a native C++ inference engine that squeezes every last token out of the machine you already own.</p>
+    </div>
+
+    <div class="grid">
+      <div class="card reveal">
+        <div class="ico">⚡</div>
+        <h3>SIMD CPU Acceleration</h3>
+        <p>Runtime dispatch auto-detects the fastest instruction set available — Intel AMX, AVX-512 or AVX2 — with OpenMP thread parallelism for every matrix operation.</p>
+        <div class="tags">
+          <span class="tag">AMX</span><span class="tag">AVX-512</span><span class="tag">AVX2</span><span class="tag g">OpenMP</span>
+        </div>
+      </div>
+
+      <div class="card reveal">
+        <div class="ico">🎮</div>
+        <h3>CUDA GPU Offload</h3>
+        <p>Full-model GPU offload with cuBLAS tensor-core prefill, on-the-fly dequant GEMV decode and flash attention — with automatic CPU fallback when CUDA is unavailable.</p>
+        <div class="tags">
+          <span class="tag p">cuBLAS</span><span class="tag g">FP16 GEMM</span><span class="tag">GEMV</span>
+        </div>
+      </div>
+
+      <div class="card reveal">
+        <div class="ico">🧩</div>
+        <h3>Mixed Quantization</h3>
+        <p>Up to 12 GGML quantization formats inside a single model file. Weights stay in their native quantized format and dequantize on-the-fly — keeping memory near file size.</p>
+        <div class="tags">
+          <span class="tag">IQ3_XXS</span><span class="tag">IQ2_S</span><span class="tag g">Q4_K_XL</span><span class="tag p">Q6_K</span>
+        </div>
+      </div>
+
+      <div class="card reveal">
+        <div class="ico">🧠</div>
+        <h3>Modern Model Families</h3>
+        <p>Qwen2.5-Coder (0.5B–7B), Gemma 4 (26B MoE) and Qwen3.6 (35B MoE) — dense and MoE architectures with RoPE, GQA, SwiGLU and RMSNorm.</p>
+        <div class="tags">
+          <span class="tag g">Dense</span><span class="tag p">MoE</span><span class="tag">GQA</span>
+        </div>
+      </div>
+
+      <div class="card reveal">
+        <div class="ico">💻</div>
+        <h3>VS Code Native Integration</h3>
+        <p>A chat panel for interactive assistance, plus Explain, Complete and Generate commands — select code and get AI help right where you work.</p>
+        <div class="tags">
+          <span class="tag g">Chat panel</span><span class="tag">Explain</span><span class="tag">Complete</span><span class="tag p">Streaming</span>
+        </div>
+      </div>
+
+      <div class="card reveal">
+        <div class="ico">🤖</div>
+        <h3>Autonomous ReAct Agent</h3>
+        <p>An agent harness that reads and writes files, runs terminal commands and searches your codebase through structured JSON tool calls — nothing leaves your machine.</p>
+        <div class="tags">
+          <span class="tag p">ReAct</span><span class="tag">Tools</span><span class="tag g">Private</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ARCHITECTURE ============ -->
+<section>
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="kicker">Architecture</div>
+      <h2>From keystroke to tokens — on-device</h2>
+      <p>A thin TypeScript layer drives a native N-API addon over a purpose-built C++ inference engine with runtime SIMD dispatch and quantized kernels.</p>
+    </div>
+    <div class="pipeline reveal">
+      <div class="pipe-step"><span class="dot" style="background:var(--accent)"></span><b>VS Code</b>UI & commands</div>
+      <div class="pipe-step"><span class="dot" style="background:var(--blue)"></span><b>TypeScript</b>panel · bridge · agent loop</div>
+      <div class="pipe-step"><span class="dot" style="background:var(--purple)"></span><b>C++ N-API</b>load · generate · status</div>
+      <div class="pipe-step"><span class="dot" style="background:var(--accent-2)"></span><b>GGUF Engine</b>quantized weights · fused kernels</div>
+      <div class="pipe-step"><span class="dot" style="background:var(--accent)"></span><b>SIMD / CUDA</b>AMX · AVX-512 · AVX2 · cuBLAS</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ MODELS ============ -->
+<section id="models">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="kicker">Supported models</div>
+      <h2>Big models, tiny footprint</h2>
+      <p>Every model is load-verified, benchmarked and ready to run on a consumer desktop with 11 GB of VRAM.</p>
+    </div>
+
+    <div class="models">
+      <div class="model-card reveal">
+        <div class="m-name">Qwen2.5-Coder <span class="chip">Dense</span></div>
+        <ul>
+          <li><span><b>0.5B</b> · Q4_K_M</span><samp>~350 MB</samp></li>
+          <li><span><b>1.5B</b> · IQ3_XXS</span><samp>~637 MB</samp></li>
+          <li><span><b>7B</b> · IQ3_XXS</span><samp>~2.9 GB</samp></li>
+        </ul>
+      </div>
+
+      <div class="model-card reveal">
+        <div class="m-name">Gemma 4 <span class="chip">MoE · 26B-A4B</span></div>
+        <ul>
+          <li><span><b>Coding</b> · Q2_K</span><samp>~8.5 GB</samp></li>
+          <li><span><b>Coding</b> · Q4_K_M</span><samp>~13 GB</samp></li>
+          <li><span><b>Instruct</b> · Q4_K_XL</span><samp>~14 GB</samp></li>
+        </ul>
+      </div>
+
+      <div class="model-card reveal">
+        <div class="m-name">Qwen3.6 <span class="chip">MoE · 35B-A3B</span></div>
+        <ul>
+          <li><span><b>A3B</b> · IQ2_M (UD)</span><samp>~9.4 GB</samp></li>
+          <li><span><b>A3B</b> · IQ3_XS</span><samp>~12 GB</samp></li>
+          <li><span><b>A3B</b> · Q4_K_M</span><samp>~20.6 GB</samp></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ QUANTIZATION ============ -->
+<section>
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="kicker">Mixed quantization</div>
+      <h2>12 GGML formats, one lean model</h2>
+      <p>Each tensor is stored in its most efficient native format and dequantized on the fly during matrix-vector multiplication.</p>
+    </div>
+    <div class="quant-grid reveal">
+      <div class="q-chip"><div class="q-name">IQ3_XXS</div><div class="q-bits">3.06 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">IQ3_S</div><div class="q-bits">3.44 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">IQ3_XS</div><div class="q-bits">3.31 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">IQ2_S</div><div class="q-bits">2.56 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">IQ2_M</div><div class="q-bits">2.69 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">Q2_K</div><div class="q-bits">2.56 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">Q4_K</div><div class="q-bits">4.06 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">Q4_K_M</div><div class="q-bits">4.50 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">Q4_K_XL</div><div class="q-bits">4.50 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">Q5_K</div><div class="q-bits">5.06 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">Q5_1</div><div class="q-bits">5.06 bits/w</div></div>
+      <div class="q-chip"><div class="q-name">Q6_K</div><div class="q-bits">6.56 bits/w</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CTA ============ -->
+<section>
+  <div class="wrap">
+    <div class="cta-panel reveal">
+      <h2>Star it, fork it, run it locally</h2>
+      <p>TinyCoder AI is open source under the MIT license. Clone the repository, drop in a GGUF model, and start coding with a private AI assistant that never leaves your machine.</p>
+      <a class="gh-big" href="https://github.com/mgorshkov/tinycoder" target="_blank" rel="noopener noreferrer">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.7 1.25 3.35.96.1-.75.4-1.25.72-1.54-2.55-.29-5.23-1.28-5.23-5.68 0-1.26.45-2.28 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.15 1.18a10.9 10.9 0 0 1 5.74 0c2.19-1.49 3.15-1.18 3.15-1.18.62 1.59.23 2.76.11 3.05.74.81 1.18 1.83 1.18 3.09 0 4.41-2.69 5.38-5.25 5.67.41.35.77 1.05.77 2.12 0 1.53-.01 2.76-.01 3.14 0 .31.21.68.8.56A11.52 11.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+        github.com/mgorshkov/tinycoder
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FOOTER ============ -->
+<footer>
+  <div class="wrap">
+    <div class="foot-logo">
+      <img src="media/tinycoder.jpg" alt="TinyCoder AI logo" />
+      <span>Tiny<b>Coder</b> AI</span>
+    </div>
+    <p>© 2026 TinyCoder AI · MIT License · <a href="https://github.com/mgorshkov/tinycoder" target="_blank" rel="noopener noreferrer">Source on GitHub</a></p>
+    <p>Built with a native C++ inference engine — no cloud, no telemetry, just tokens.</p>
+  </div>
+</footer>
+
+<script>
+  // Scroll reveal
+  const observer = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add("visible");
+          observer.unobserve(entry.target);
+        }
+      });
+    },
+    { threshold: 0.12, rootMargin: "0px 0px -40px 0px" }
+  );
+  document.querySelectorAll(".reveal").forEach((el) => observer.observe(el));
+</script>
+
+</body>
+</html>

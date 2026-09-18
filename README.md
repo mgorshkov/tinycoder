@@ -119,56 +119,65 @@ All weights are stored in their **native quantized format** in memory and dequan
 - **Generate code** — generate from comments/descriptions
 - **Streaming output** — see tokens as they're generated
 - **Status bar** — model status indicator with periodic updates
+- **Autonomous coding agent** — ReAct (Reasoning + Acting) harness that reads/writes
+  files, runs terminal commands and searches the codebase through structured
+  JSON tool calls (`TinyCoder: Run Agent`)
+
+## Getting a Model
+
+TinyCoder loads **GGUF v3** files from the model families below. Every model in the
+table has been load-verified and benchmarked on the project's reference hardware
+(i7-4790K + RTX 2080 Ti 11 GB); "GPU mode" is what the engine automatically
+selects on that card.
+
+| Model | Quantization | Size (approx) | GPU mode on 11 GB | Notes |
+|-------|-------------|---------------|-------------------|-------|
+| `Qwen2.5-Coder-1.5B` | Q2_K | ~0.7 GB | full offload | Lightweight coding, 132 tg tok/s |
+| `Qwen2.5-Coder-1.5B` | IQ3_XXS (imat) | ~0.6 GB | full offload | Recommended balanced |
+| `Qwen2.5-Coder-7B` | IQ2_S | ~2.4 GB | full offload | Ultra-compact 7B |
+| `Qwen2.5-Coder-7B` | IQ3_XXS (imat) | ~2.9 GB | full offload | Recommended 7B |
+| `Gemma 4 (26B-A4B)` | Q4_K_XL (qat-UD) | ~14 GB | full offload (fits) | Instruction-tuned MoE |
+| `Qwen3.6-35B-A3B` | UD-IQ1_M | ~9.4 GB | full offload | Ultra-compact 35B MoE, 13 tg tok/s |
+| `Qwen3.6-35B-A3B` | UD-IQ2_M | ~10.7 GB | hybrid (experts CPU) | Ultra-compact MoE |
+| `Qwen3.6-35B-A3B` | UD-Q4_K_M | ~20.6 GB | hybrid (experts CPU) | **9.7 tg tok/s decode — recommended** |
+| `Qwen3.6-27B` | UD-Q4_K_XL | ~16.7 GB | partial offload (34/65) | Dense qwen35 |
+| `Qwen3.8-27B` | UD-Q4_K_M | ~15.3 GB | partial offload (37/65) | Dense qwen35 with IQ4_NL/Q8_K kernels |
+| `Ornith-1.5-35B-A3B` | Q8_0 | ~34.4 GB | hybrid (experts CPU) | Full-precision MoE |
+| `Ornith-1.5-35B` | Q4_K_M | ~20.2 GB | hybrid (experts CPU) | 41-layer qwen35moe variant |
+
+Download a `.gguf` file and point TinyCoder at it:
+- **In VS Code**: set `tinycoder.modelPath` in settings, or use
+  *TinyCoder: Open Agent Options* → Model → Browse, then *Load Model*.
+- **CLI / API**: set `TINYCODER_MODEL_PATH` or pass the path to `Model::load()`.
+
+> The Gemma 4 *coding* files (`gemma4-coding-*`) hit a loader gap ("missing attention
+> weights for layer 5" — the file names its attention tensors differently), and the
+> `gemma-2-*` files use the `gemma2` architecture, which is not yet supported; both
+> print a clear load error rather than producing wrong output.
 
 ## Project Structure
 
 ```
 tinycoder/
-├── include/                        # C++ headers
-│   ├── ModelConfig.hpp             # Model & inference configuration
-│   ├── GGUFLoader.hpp              # GGUF v3 file format loader
-│   ├── GGMLDequantize.hpp          # Multi-type dequantization (Q5_K, IQ3_XXS, etc.)
-│   ├── IQ3XXS.hpp                  # Legacy IQ3_XXS block-level dequantization
-│   ├── LMHead.hpp                  # LM head computation (CPU OpenMP path)
-│   ├── LMHeadCUDA.hpp              # LM head CUDA (cublasSgemv) interface
-│   ├── Model.hpp                   # Transformer model (forward, generate, KV cache)
-│   ├── SIMDMatMulVec.hpp           # SIMD-accelerated dot product & accumulate
-│   └── Tokenizer.hpp               # BPE tokenizer (Qwen2.5)
+├── CMakeLists.txt                  # Builds the N-API addon; fetches tinycoder-inference
 ├── src/
-│   ├── cpp/                        # C++ source
-│   │   ├── core/                   # Engine core (compiled once into tinycoder_core)
-│   │   │   ├── ChatTemplateRenderer.cpp  # Chat template formatting
-│   │   │   ├── GGUFLoader.cpp            # GGUF v3 reader (metadata + tensor data)
-│   │   │   ├── GridTables.cpp            # IQ2_S grid lookup table (1024 entries)
-│   │   │   ├── GridTablesIQ3S.cpp        # IQ3_S grid lookup table (512 entries)
-│   │   │   ├── Model.cpp                 # Transformer model (forward, generate)
-│   │   │   ├── ModelDebug.cpp            # Debug helpers for the model
-│   │   │   ├── ModelForward.cpp          # Forward pass implementation
-│   │   │   ├── ModelForwardDebug.cpp     # Forward pass debug helpers
-│   │   │   ├── ModelGeneration.cpp       # Generation loop
-│   │   │   ├── ModelInternal.cpp         # Internal model helpers
-│   │   │   ├── ModelLoad.cpp             # Model loading & weight prep
-│   │   │   ├── ModelMoE.cpp              # Mixture-of-Experts layers
-│   │   │   ├── ModelPrimitives.cpp       # Core primitives
-│   │   │   ├── ModelSampling.cpp         # Token sampling
-│   │   │   ├── QuantizedEmbedding.cpp    # Quantized token embedding dequantization
-│   │   │   ├── QuantizedMatrix.cpp       # Quantized matrix-vector multiply (CUDA/CPU)
-│   │   │   ├── SIMDMatMulVec.cpp         # SIMD dispatch (AVX2/AVX-512/scalar)
-│   │   │   ├── SIMDMatMulVecAVX2.cpp     # AVX2 SIMD kernels
-│   │   │   ├── SIMDMatMulVecAVX512.cpp   # AVX-512 SIMD kernels
-│   │   │   ├── ThreadPool.cpp            # Thread pool for parallel loops
-│   │   │   ├── Tokenizer.cpp             # BPE tokenizer (GGUF embedded + file loading)
-│   │   │   └── LMHeadCUDA.cu             # CUDA LM head (cublasSgemv)
-│   │   └── bridge/                 # N-API native addon (load, generate, status)
-│   │       └── Bridge.cpp
+│   ├── cpp/bridge/                 # N-API native addon (load, generate, status)
+│   │   └── Bridge.cpp
 │   └── ts/                         # TypeScript source
 │       ├── extension.ts            # VS Code extension entry (commands, status bar)
 │       ├── panel.ts                # WebView chat panel (standalone + sidebar)
-│       └── nativeBridge.ts         # Native addon wrapper (async load/generate)
-├── unit_tests/                     # Unit tests
-│   ├── CMakeLists.txt              # Test build config
-│   └── ModelTest.cpp               # Model loading & inference tests
-├── CMakeLists.txt                  # CMake build (with np fetch, N-API, CUDA)
+│       ├── nativeBridge.ts         # Native addon wrapper (async load/generate)
+│       └── agent/                  # Autonomous agent harness (ReAct)
+│           ├── agentLoop.ts        # Core ReAct loop engine
+│           ├── tools.ts            # Tool JSON schemas + VS Code tool executors
+│           ├── prompt.ts           # System prompt + tool protocol builder
+│           ├── chatTemplate.ts     # Conversation → prompt renderer
+│           ├── inference.ts        # callAPInference abstraction (swappable backend)
+│           ├── compaction.ts       # Token pruning / history compaction
+│           ├── config.ts           # Agent config (settings loader/saver)
+│           ├── runner.ts           # Shared "run agent" helper (model ensure + loop)
+│           └── optionsPanel.ts     # Agent options webview
+├── tests/                          # Pure Node smoke/integration tests (test:agent)
 ├── package.json                    # VS Code extension manifest
 ├── tsconfig.json                   # TypeScript configuration
 ├── scripts/
@@ -177,9 +186,7 @@ tinycoder/
 ├── media/
 │   ├── icon.png                    # Extension icon
 │   └── icon.svg                    # Extension icon (vector)
-└── .vscode/
-    ├── launch.json                 # Debug configurations
-    └── tasks.json                  # Build tasks
+└── plans/                          # Design documents
 ```
 
 ## Dependencies

@@ -8,6 +8,7 @@ tsconfig.json
 **/*.cpp
 **/*.hpp
 **/CMakeLists.txt
+tests/**
 build/**
 !build/Release/*.node
 !.vscode/launch.json
