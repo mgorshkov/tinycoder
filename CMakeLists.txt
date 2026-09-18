@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.18.0)
 # (https://github.com/mgorshkov/tinycoder-inference) and is consumed here via
 # FetchContent as the tinycoder_core static library. This tree keeps only the
 # N-API bridge (src/cpp/bridge) and the TypeScript extension sources.
-project(tinycoder VERSION 0.4.0 DESCRIPTION "High-Performant Local AI coding agent" LANGUAGES CXX)
+project(tinycoder VERSION 0.5.0 DESCRIPTION "High-Performant Local AI coding agent" LANGUAGES CXX)
 enable_testing()
 
 # ---- Options ----

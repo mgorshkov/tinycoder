@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="125 125 1004 1004" fill="none">
+  <g fill="#000000" stroke="#000000" stroke-linecap="round" stroke-linejoin="round">
+    <!-- left code bracket -->
+    <polyline points="405,492 217,701 405,910" fill="none" stroke-width="77"/>
+
+    <!-- right code bracket -->
+    <polyline points="839,492 1029,701 839,910" fill="none" stroke-width="77"/>
+
+    <!-- central rounded square outline -->
+    <rect x="477" y="611" width="300.5" height="261.5" rx="62" ry="62" fill="none" stroke-width="41.5"/>
+
+    <!-- outlet/robot eyes -->
+    <rect x="543" y="707" width="45" height="76" rx="22.5" ry="22.5" stroke="none" fill="#000000"/>
+    <rect x="667" y="707" width="45" height="76" rx="22.5" ry="22.5" stroke="none" fill="#000000"/>
+
+    <!-- lightning bolt -->
+    <polygon points="691,255 541,443 620,455 599,560 740,400 662,386" stroke="none" fill="#000000"/>
+  </g>
+</svg>

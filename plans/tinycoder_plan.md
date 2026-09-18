@@ -16,11 +16,12 @@ All common inference parameters are configurable: **temperature, max‑tokens, t
 |---|---|
 | **Model loading** | Load a single *.gguf* model via a file‑picker. Only one model is active at a time. |
 | **Sidebar chat** | Webview panel (see [`src/ts/panel.ts`](src/ts/panel.ts:1)) for interactive messaging. |
-| **Command‑palette actions** | `tinycoder.explainCode`, `tinycoder.completeCode`, `tinycoder.generateCode`, `tinycoder.loadModel`. |
+| **Command‑palette actions** | `tinycoder.explainCode`, `tinycoder.completeCode`, `tinycoder.generateCode`, `tinycoder.loadModel`, `tinycoder.agentRun`, `tinycoder.openAgentOptions`. |
 | **Status‑bar item** | Shows *model loaded* / *inference ready* and allows quick reload. |
 | **Inference settings UI** | Settings contribution (`package.json`) with inputs for temperature, max‑tokens, top‑p, repeat‑penalty. |
 | **Terminal integration** | New terminal command `TinyCoder: Infer Selected Text` that reads the current selection, sends it to the native bridge, and streams output to the terminal. |
 | **Native bridge** | C++/CUDA backend (see [`src/cpp/bridge/*.cpp`](src/cpp/bridge/Bridge.cpp:1)) exposing `loadModel`, `runInference`. |
+| **Agent harness (ReAct)** | Autonomous coding agent: JSON tool-call loop (`readFile`/`writeFile`/`patchFile`/`executeTerminalCommand`/`searchCodebase`), tool definitions as JSON schemas, conversation compaction, and an options webview (`tinycoder.openAgentOptions`). Lives in [`src/ts/agent/`](src/ts/agent/types.ts:1). |
 
 ---
 

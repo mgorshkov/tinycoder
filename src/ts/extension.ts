@@ -26,8 +26,49 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { TinyCoderPanel } from './panel';
 import { getStatus, isModelLoaded, generate } from './nativeBridge';
+import { runAgentLoop } from './agent/agentLoop';
+import { loadAgentConfig } from './agent/config';
+import { AgentOptionsPanel } from './agent/optionsPanel';
+import { AgentEvent } from './agent/types';
+import { runAgentTask } from './agent/runner';
 
 let panel: TinyCoderPanel | undefined;
+let agentOptionsPanel: AgentOptionsPanel | undefined;
+
+/** Show agent progress events in an output channel. */
+const agentOutput = vscode.window.createOutputChannel('TinyCoder Agent');
+
+function onAgentEvent(event: AgentEvent): void {
+    switch (event.type) {
+        case 'iteration':
+            agentOutput.appendLine(`\n[iteration ${event.iteration}/${event.maxIterations}]`);
+            break;
+        case 'assistantText':
+            agentOutput.appendLine(`\n[assistant]\n${event.text}`);
+            break;
+        case 'toolCall':
+            agentOutput.appendLine(
+                `\n[tool] ${event.call.name}(${JSON.stringify(event.call.arguments)})`
+            );
+            break;
+        case 'toolResult':
+            agentOutput.appendLine(
+                `[result ${event.result.durationMs}ms ${event.result.ok ? 'ok' : 'ERROR'}]\n${event.result.output}`
+            );
+            break;
+        case 'compaction':
+            agentOutput.appendLine(
+                `[compaction] removed ${event.removed} messages, ${event.remaining} remain`
+            );
+            break;
+        case 'final':
+            agentOutput.appendLine(`\n[final]\n${event.text}`);
+            break;
+        case 'error':
+            agentOutput.appendLine(`[error] ${event.message}`);
+            break;
+    }
+}
 
 /**
  * Provider for the TinyCoder sidebar webview view.
@@ -53,7 +94,7 @@ class TinyCoderViewProvider implements vscode.WebviewViewProvider {
         }
         // Register the sidebar view so messages can be sent back to it
         panel.setSidebarView(webviewView);
-        webviewView.webview.html = panel.getHtmlContent();
+        webviewView.webview.html = panel.getHtmlContent(webviewView.webview.cspSource);
 
         webviewView.webview.onDidReceiveMessage(
             async (message: any) => {
@@ -233,6 +274,71 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    // Register command to run the autonomous coding agent (ReAct harness).
+    const agentRunCommand = vscode.commands.registerCommand('tinycoder.agentRun', async () => {
+        // Ask for the task (allow reusing the active selection as context).
+        const editor = vscode.window.activeTextEditor;
+        const selectionText = editor && !editor.selection.isEmpty
+            ? editor.document.getText(editor.selection)
+            : '';
+        const prompt = await vscode.window.showInputBox({
+            prompt: 'What should the TinyCoder agent do?',
+            placeHolder: 'e.g. Implement a ReAct agent harness in the src/ts/agent directory',
+            value: selectionText
+        });
+        if (!prompt || prompt.trim().length === 0) {
+            return;
+        }
+
+        agentOutput.clear();
+        agentOutput.appendLine('TinyCoder Agent: starting');
+        agentOutput.show(true);
+
+        const start = Date.now();
+        const finalAnswer = await runAgentTask(prompt, onAgentEvent);
+        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+
+        vscode.window.showInformationMessage(
+            finalAnswer
+                ? `TinyCoder agent finished in ${elapsed}s. See output.`
+                : 'TinyCoder agent did not run (see error above).',
+            'Open Output'
+        ).then((choice) => {
+            if (choice === 'Open Output') {
+                agentOutput.show(true);
+            }
+        });
+    });
+
+    // Register command to open the agent options panel.
+    const openAgentOptionsCommand = vscode.commands.registerCommand(
+        'tinycoder.openAgentOptions',
+        () => {
+            if (agentOptionsPanel) {
+                try {
+                    agentOptionsPanel.reveal();
+                    return;
+                } catch (err) {
+                    // Panel was closed by the user; recreate below.
+                    agentOptionsPanel = undefined;
+                }
+            }
+            agentOptionsPanel = new AgentOptionsPanel(context);
+        }
+    );
+
+    // Register command to open the tinycoder settings in the native UI
+    // (fallback for the "Settings" button in the chat panel).
+    const openSettingsCommand = vscode.commands.registerCommand(
+        'tinycoder.openSettings',
+        async () => {
+            await vscode.commands.executeCommand(
+                'workbench.action.openSettings',
+                '@ext:tinycoder.tinycoder'
+            );
+        }
+    );
+
     // Register command to show model status
     const statusCommand = vscode.commands.registerCommand('tinycoder.showStatus', () => {
         const status = getStatus();
@@ -253,10 +359,13 @@ export function activate(context: vscode.ExtensionContext) {
         generateCommand,
         loadModelCommand,
         statusCommand,
-        inferFromTerminalCommand
+        inferFromTerminalCommand,
+        agentRunCommand,
+        openAgentOptionsCommand,
+        openSettingsCommand
     );
 
-    // Add status bar item
+    // Add status bar item (model status; click shows status)
     const statusBarItem = vscode.window.createStatusBarItem(
         vscode.StatusBarAlignment.Right,
         100
@@ -266,6 +375,17 @@ export function activate(context: vscode.ExtensionContext) {
     statusBarItem.tooltip = 'Click to check TinyCoder status';
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
+
+    // Add a dedicated Settings gear in the status bar (always visible).
+    const statusBarSettingsItem = vscode.window.createStatusBarItem(
+        vscode.StatusBarAlignment.Right,
+        101
+    );
+    statusBarSettingsItem.text = '$(gear) TinyCoder Settings';
+    statusBarSettingsItem.command = 'tinycoder.openAgentOptions';
+    statusBarSettingsItem.tooltip = 'Open TinyCoder Settings (model, inference, agent options)';
+    statusBarSettingsItem.show();
+    context.subscriptions.push(statusBarSettingsItem);
 
     // Update status bar periodically
     setInterval(() => {
@@ -293,5 +413,9 @@ export function deactivate() {
     if (panel) {
         panel.dispose();
         panel = undefined;
+    }
+    if (agentOptionsPanel) {
+        agentOptionsPanel.dispose();
+        agentOptionsPanel = undefined;
     }
 }
